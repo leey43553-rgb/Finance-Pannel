@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gestion Financière</title>
+    <meta name="description" content="Application bureautique de gestion financière 100 % hors-ligne pour les entreprises en Algérie." />
+    <meta property="og:title" content="Gestion Financière" />
+    <meta property="og:description" content="Application bureautique de gestion financière 100 % hors-ligne pour les entreprises en Algérie." />
+    <meta property="og:type" content="website" />
+    <script>
+      (function () {
+        try {
+          var ownDesc = Object.getOwnPropertyDescriptor(window, 'fetch');
+          var target = window;
+          var desc = ownDesc;
+          while (!desc && target) {
+            target = Object.getPrototypeOf(target);
+            if (target) desc = Object.getOwnPropertyDescriptor(target, 'fetch');
+          }
+          if (desc && typeof desc.set !== 'function' && (!ownDesc || ownDesc.configurable)) {
+            var currentFetch = window.fetch;
+            Object.defineProperty(window, 'fetch', {
+              configurable: true,
+              enumerable: true,
+              get: function () { return currentFetch; },
+              set: function (fn) { currentFetch = fn; }
+            });
+          }
+        } catch (_) {}
+        window.addEventListener('error', function (ev) {
+          if (ev && typeof ev.filename === 'string' && ev.filename.indexOf('chrome-extension://') === 0) {
+            ev.preventDefault();
+          }
+        }, true);
+      })();
+    </script>
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
