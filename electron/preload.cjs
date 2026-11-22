@@ -12,8 +12,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('pdf:printToPDF', options),
   openFolder: (filePath) =>
     ipcRenderer.invoke('pdf:openFolder', filePath),
-  printDirect: () =>
-    ipcRenderer.invoke('pdf:printDirect'),
+  getPrinters: () =>
+    ipcRenderer.invoke('printers:list'),
+  printDirect: (options = {}) =>
+    ipcRenderer.invoke('pdf:printDirect', options),
   selectFolder: (currentDir = '') =>
     ipcRenderer.invoke('backup:selectFolder', currentDir),
   getDefaultBackupFolder: () =>

@@ -1,32 +1,61 @@
 import React, { useMemo, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { Ban, BookOpen, CheckCircle2, Plus, Search, Trash2, X } from 'lucide-react';
+import { Ban, BookOpen, CheckCircle2, Edit3, Plus, Search, Trash2, X } from 'lucide-react';
 import { db } from '../db/database';
 import type { OutgoingCheque, OutgoingChequeStatus } from '../db/types';
 import {
   cancelUnusedChequeLeaf,
   createChequeBook,
   createOutgoingCheque,
+  updateOutgoingCheque,
   updateOutgoingChequeStatus,
 } from '../services/treasuryActions';
 import { useAppStore } from '../store/useAppStore';
 import { generateChequeSerialSequence } from '../utils/cheque';
-import { addMoney, formatMoney, parseMoneyInputToCentimes } from '../utils/money';
+import { addMoney, centimesToInputString, formatMoney, parseMoneyInputToCentimes } from '../utils/money';
 import { MoreOptionsButton } from '../components/MoreOptionsButton';
 import { SafeDeleteDialog } from '../components/SafeDeleteDialog';
 import { useUiMode } from '../hooks/useUiMode';
 
 const OUTGOING_STATUS_META: Record<
   OutgoingChequeStatus,
-  { label: string; className: string }
+  { label: string; className: string; badgeClass: string }
 > = {
-  prepare: { label: 'Préparé', className: 'text-slate-700' },
-  remis: { label: 'Remis', className: 'text-amber-700' },
-  depose: { label: 'Déposé', className: 'text-amber-700' },
-  en_attente: { label: 'En attente', className: 'text-amber-700' },
-  encaisse: { label: 'Encaissé', className: 'text-emerald-700 font-semibold' },
-  rejete: { label: 'Rejeté', className: 'text-red-700 font-semibold' },
-  annule: { label: 'Annulé', className: 'text-slate-400 line-through' },
+  prepare: {
+    label: 'Préparé',
+    className: 'text-slate-700',
+    badgeClass: 'bg-slate-100 text-slate-700 border-slate-200',
+  },
+  remis: {
+    label: 'Remis',
+    className: 'text-amber-700',
+    badgeClass: 'bg-amber-50 text-amber-800 border-amber-200',
+  },
+  depose: {
+    label: 'Déposé',
+    className: 'text-amber-700',
+    badgeClass: 'bg-amber-50 text-amber-800 border-amber-200',
+  },
+  en_attente: {
+    label: 'Non payé (en attente)',
+    className: 'text-amber-700',
+    badgeClass: 'bg-amber-50 text-amber-800 border-amber-200',
+  },
+  encaisse: {
+    label: 'Payé (encaissé)',
+    className: 'text-emerald-700 font-semibold',
+    badgeClass: 'bg-emerald-50 text-emerald-800 border-emerald-200',
+  },
+  rejete: {
+    label: 'Rejeté',
+    className: 'text-red-700 font-semibold',
+    badgeClass: 'bg-red-50 text-red-700 border-red-200',
+  },
+  annule: {
+    label: 'Annulé',
+    className: 'text-slate-400 line-through',
+    badgeClass: 'bg-slate-100 text-slate-500 border-slate-200',
+  },
 };
 
 export const OutgoingChequesPage: React.FC = () => {
@@ -65,8 +94,9 @@ export const OutgoingChequesPage: React.FC = () => {
   const [bankFilter, setBankFilter] = useState('toutes');
   const [statusFilter, setStatusFilter] = useState<'tous' | OutgoingChequeStatus>('tous');
 
-  // Modale émission chèque
+  // Modale émission / modification chèque
   const [issueOpen, setIssueOpen] = useState(false);
+  const [editingOutgoingId, setEditingOutgoingId] = useState<string | null>(null);
   const [showMoreOptions, setShowMoreOptions] = useState(false);
   const [fBankId, setFBankId] = useState('');
   const [fLeafId, setFLeafId] = useState('');
@@ -154,13 +184,14 @@ export const OutgoingChequesPage: React.FC = () => {
   const totals = useMemo(() => {
     let pending = 0;
     let cleared = 0;
-    for (const c of filteredCheques) {
+    let rejected = 0;
+    for (const c of outgoingCheques) {
       if (c.status === 'encaisse') cleared = addMoney(cleared, c.baseDzdAmountCentimes);
-      else if (c.status !== 'annule' && c.status !== 'rejete')
-        pending = addMoney(pending, c.baseDzdAmountCentimes);
+      else if (c.status === 'rejete') rejected = addMoney(rejected, c.baseDzdAmountCentimes);
+      else if (c.status !== 'annule') pending = addMoney(pending, c.baseDzdAmountCentimes);
     }
-    return { pending, cleared };
-  }, [filteredCheques]);
+    return { pending, cleared, rejected };
+  }, [outgoingCheques]);
 
   const booksWithStats = useMemo(() => {
     return chequeBooks
@@ -190,6 +221,7 @@ export const OutgoingChequesPage: React.FC = () => {
 
   const openIssueModal = () => {
     const firstBank = bankAccounts.find((b) => b.active);
+    setEditingOutgoingId(null);
     setFBankId(firstBank?.id || '');
     setFLeafId('');
     setFManualNum('');
@@ -204,6 +236,30 @@ export const OutgoingChequesPage: React.FC = () => {
     setFLinkedId('');
     setFInitialStatus('remis');
     setFNotes('');
+    setShowMoreOptions(false);
+    setIssueOpen(true);
+  };
+
+  const openEditOutgoingModal = (c: OutgoingCheque) => {
+    setEditingOutgoingId(c.id);
+    setFBankId(c.bankAccountId);
+    setFLeafId(c.chequeLeafId || '');
+    setFManualNum(c.chequeNumber);
+    setFBeneficiary(c.beneficiary);
+    setFContactId(c.contactId || '');
+    setFIssueDate(c.issueDate);
+    setFAmountText(centimesToInputString(c.amountCentimes));
+    setFCurrency(c.currency);
+    setFExchangeRate(String(c.exchangeRate || 1));
+    setFPurpose(c.purpose);
+    setFLinkedType(c.linkedType);
+    setFLinkedId(c.linkedId || '');
+    setFInitialStatus(
+      c.status === 'prepare' || c.status === 'remis' || c.status === 'depose' || c.status === 'en_attente'
+        ? c.status
+        : 'remis'
+    );
+    setFNotes(c.notes || '');
     setShowMoreOptions(false);
     setIssueOpen(true);
   };
@@ -242,29 +298,48 @@ export const OutgoingChequesPage: React.FC = () => {
       return;
     }
     const rate = parseFloat(fExchangeRate.replace(',', '.'));
+    const safeRate = Number.isFinite(rate) && rate > 0 ? rate : 1;
     try {
-      await createOutgoingCheque({
-        bankAccountId: fBankId,
-        chequeLeafId: fLeafId || undefined,
-        chequeNumber: fLeafId ? undefined : fManualNum,
-        beneficiary: fBeneficiary,
-        contactId: fContactId || undefined,
-        issueDate: fIssueDate,
-        amountCentimes: amount,
-        currency: fCurrency,
-        exchangeRate: Number.isFinite(rate) && rate > 0 ? rate : 1,
-        purpose: fPurpose,
-        linkedType: fLinkedType,
-        linkedId: fLinkedId || undefined,
-        initialStatus: fInitialStatus,
-        notes: fNotes,
-      });
+      if (editingOutgoingId) {
+        await updateOutgoingCheque({
+          chequeId: editingOutgoingId,
+          chequeNumber: fManualNum || undefined,
+          beneficiary: fBeneficiary,
+          contactId: fContactId || undefined,
+          issueDate: fIssueDate,
+          amountCentimes: amount,
+          currency: fCurrency,
+          exchangeRate: safeRate,
+          purpose: fPurpose,
+          linkedType: fLinkedType,
+          linkedId: fLinkedId || undefined,
+          notes: fNotes,
+        });
+        pushToast({ type: 'success', title: 'Chèque émis modifié' });
+      } else {
+        await createOutgoingCheque({
+          bankAccountId: fBankId,
+          chequeLeafId: fLeafId || undefined,
+          chequeNumber: fLeafId ? undefined : fManualNum,
+          beneficiary: fBeneficiary,
+          contactId: fContactId || undefined,
+          issueDate: fIssueDate,
+          amountCentimes: amount,
+          currency: fCurrency,
+          exchangeRate: safeRate,
+          purpose: fPurpose,
+          linkedType: fLinkedType,
+          linkedId: fLinkedId || undefined,
+          initialStatus: fInitialStatus,
+          notes: fNotes,
+        });
+        pushToast({
+          type: 'success',
+          title: 'Chèque émis enregistré',
+          message: 'En attente d’encaissement (la trésorerie sera débitée au statut Encaissé).',
+        });
+      }
       setIssueOpen(false);
-      pushToast({
-        type: 'success',
-        title: 'Chèque émis enregistré',
-        message: 'En attente d’encaissement (la trésorerie sera débitée au statut Encaissé).',
-      });
     } catch (err) {
       pushToast({
         type: 'error',
@@ -282,6 +357,7 @@ export const OutgoingChequesPage: React.FC = () => {
         chequeId: statusTarget.cheque.id,
         nextStatus: statusTarget.nextStatus,
         clearingDate: statusTarget.nextStatus === 'encaisse' ? clearingDate : undefined,
+        rejectionDate: statusTarget.nextStatus === 'rejete' ? clearingDate : undefined,
         reason: statusReason || undefined,
       });
       pushToast({
@@ -419,19 +495,25 @@ export const OutgoingChequesPage: React.FC = () => {
 
       {activeTab === 'cheques' ? (
         <div className="space-y-4">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div className="rounded-lg border border-slate-200 bg-white p-4">
               <div className="text-xs text-slate-500">
-                Chèques émis en attente (non encore débités de la banque)
+                En attente d’encaissement
               </div>
               <div className="mt-1 text-lg font-bold text-amber-700 tabular-nums">
                 {formatMoney(totals.pending, defaultCurrency, currencies)}
               </div>
             </div>
             <div className="rounded-lg border border-slate-200 bg-white p-4">
-              <div className="text-xs text-slate-500">Chèques émis encaissés (sorties réelles)</div>
+              <div className="text-xs text-slate-500">Encaissés (sorties réelles)</div>
               <div className="mt-1 text-lg font-bold text-slate-900 tabular-nums">
                 {formatMoney(totals.cleared, defaultCurrency, currencies)}
+              </div>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white p-4">
+              <div className="text-xs text-slate-500">Rejetés</div>
+              <div className="mt-1 text-lg font-bold text-red-700 tabular-nums">
+                {formatMoney(totals.rejected, defaultCurrency, currencies)}
               </div>
             </div>
           </div>
@@ -478,11 +560,21 @@ export const OutgoingChequesPage: React.FC = () => {
                         <td className="px-3 py-2.5 text-right font-semibold text-slate-900 tabular-nums whitespace-nowrap">
                           {formatMoney(c.amountCentimes, c.currency, currencies)}
                         </td>
-                        <td className={`px-3 py-2.5 whitespace-nowrap ${meta.className}`}>
-                          {meta.label}
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <span
+                            className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${meta.badgeClass}`}
+                          >
+                            {meta.label}
+                          </span>
                           {c.clearingDate && c.status === 'encaisse' && (
-                            <div className="text-[10px] font-normal text-slate-500">
+                            <div className="mt-0.5 text-[10px] font-normal text-slate-500">
                               Encaissé le {c.clearingDate}
+                            </div>
+                          )}
+                          {c.status === 'rejete' && (c.rejectionReason || c.cancelReason) && (
+                            <div className="mt-0.5 text-[10px] font-normal text-red-600">
+                              {c.rejectedAt ? `${c.rejectedAt} · ` : ''}
+                              {c.rejectionReason || c.cancelReason}
                             </div>
                           )}
                         </td>
@@ -527,6 +619,14 @@ export const OutgoingChequesPage: React.FC = () => {
                                 </select>
                               </>
                             )}
+                            <button
+                              type="button"
+                              onClick={() => openEditOutgoingModal(c)}
+                              title="Modifier ce chèque"
+                              className="rounded p-1 text-slate-600 hover:bg-slate-100"
+                            >
+                              <Edit3 className="h-3.5 w-3.5" />
+                            </button>
                             <button
                               type="button"
                               onClick={() =>
@@ -773,7 +873,11 @@ export const OutgoingChequesPage: React.FC = () => {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
           <div className="w-full max-w-2xl rounded-lg border border-slate-200 bg-white shadow-xl">
             <div className="flex items-center justify-between border-b border-slate-200 bg-[#0F1E36] px-6 py-4 text-white">
-              <h2 className="text-base font-semibold">Émettre un chèque</h2>
+              <h2 className="text-base font-semibold">
+                {editingOutgoingId
+                  ? `Modifier le chèque émis N° ${fManualNum}`
+                  : 'Émettre un chèque'}
+              </h2>
               <button
                 type="button"
                 onClick={() => setIssueOpen(false)}
@@ -787,7 +891,8 @@ export const OutgoingChequesPage: React.FC = () => {
                 <div>
                   <label className="block text-xs font-medium text-slate-700">Banque émettrice *</label>
                   <select
-                    required
+                    required={!editingOutgoingId}
+                    disabled={Boolean(editingOutgoingId)}
                     value={fBankId}
                     onChange={(e) => {
                       const bank = bankAccounts.find((b) => b.id === e.target.value);
@@ -795,7 +900,7 @@ export const OutgoingChequesPage: React.FC = () => {
                       setFLeafId('');
                       if (bank) setFCurrency(bank.currency);
                     }}
-                    className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm disabled:bg-slate-100"
                   >
                     <option value="">— Sélectionner —</option>
                     {bankAccounts
@@ -810,9 +915,20 @@ export const OutgoingChequesPage: React.FC = () => {
 
                 <div>
                   <label className="block text-xs font-medium text-slate-700">
-                    Numéro disponible du chéquier *
+                    {editingOutgoingId
+                      ? 'N° du chèque'
+                      : 'Numéro disponible du chéquier *'}
                   </label>
-                  {availableLeavesForIssueBank.length > 0 ? (
+                  {editingOutgoingId ? (
+                    <input
+                      type="text"
+                      required
+                      disabled={Boolean(fLeafId)}
+                      value={fManualNum}
+                      onChange={(e) => setFManualNum(e.target.value)}
+                      className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-sm disabled:bg-slate-100"
+                    />
+                  ) : availableLeavesForIssueBank.length > 0 ? (
                     <select
                       required
                       value={fLeafId}
@@ -1034,7 +1150,7 @@ export const OutgoingChequesPage: React.FC = () => {
                   type="submit"
                   className="rounded-md bg-[#0F1E36] px-5 py-2 text-sm font-medium text-white hover:bg-[#1a2f52]"
                 >
-                  Enregistrer le chèque
+                  {editingOutgoingId ? 'Enregistrer les modifications' : 'Enregistrer le chèque'}
                 </button>
               </div>
             </form>
@@ -1070,18 +1186,34 @@ export const OutgoingChequesPage: React.FC = () => {
                 </p>
               </div>
             ) : (
-              <div>
-                <label className="block text-xs font-medium text-slate-700">Motif *</label>
-                <input
-                  type="text"
-                  required
-                  value={statusReason}
-                  onChange={(e) => setStatusReason(e.target.value)}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
-                />
-                <p className="mt-2 text-xs text-slate-500">
-                  Le numéro {statusTarget.cheque.chequeNumber} restera bloqué et ne pourra jamais être réutilisé.
-                </p>
+              <div className="space-y-3">
+                {statusTarget.nextStatus === 'rejete' && (
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700">
+                      Date du rejet *
+                    </label>
+                    <input
+                      type="date"
+                      required
+                      value={clearingDate}
+                      onChange={(e) => setClearingDate(e.target.value)}
+                      className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                    />
+                  </div>
+                )}
+                <div>
+                  <label className="block text-xs font-medium text-slate-700">Motif *</label>
+                  <input
+                    type="text"
+                    required
+                    value={statusReason}
+                    onChange={(e) => setStatusReason(e.target.value)}
+                    className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                  />
+                  <p className="mt-2 text-xs text-slate-500">
+                    Le numéro {statusTarget.cheque.chequeNumber} restera bloqué et ne pourra jamais être réutilisé.
+                  </p>
+                </div>
               </div>
             )}
             <div className="flex justify-end gap-2">

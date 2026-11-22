@@ -121,6 +121,7 @@ export default function App() {
           <Route path="/aide" element={<HelpPage />} />
           <Route path="/a-propos" element={<AboutPage />} />
         </Route>
+        <Route path="/imprimer/lot-factures" element={<PrintDocumentPage />} />
         <Route path="/imprimer/:kind/:id" element={<PrintDocumentPage />} />
       </Routes>
       <ToastContainer />

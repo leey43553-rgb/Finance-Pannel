@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useLiveQuery } from 'dexie-react-hooks';
 import {
   ArrowUpDown,
@@ -14,7 +15,7 @@ import {
 } from 'lucide-react';
 import { db } from '../db/database';
 import type { ComputedInvoiceStatus, CustomerInvoice, SupplierInvoice } from '../db/types';
-import { cancelInvoice } from '../services/financeActions';
+import { cancelInvoice, revertInvoiceToUnpaid } from '../services/financeActions';
 import { exportCustomerInvoiceToModelExcel } from '../services/excelService';
 import { useAppStore } from '../store/useAppStore';
 import { compareDocumentNumbers, resolveEffectiveCompanyProfile } from '../utils/documentHelpers';
@@ -26,6 +27,7 @@ import {
 import { addMoney, formatMoney } from '../utils/money';
 import { buildPdfFileName } from '../utils/print';
 import { InvoiceFormModal } from '../components/InvoiceFormModal';
+import { InvoiceStatusPaymentModal } from '../components/InvoiceStatusPaymentModal';
 import { ExcelInvoiceImportModal } from '../components/ExcelInvoiceImportModal';
 import { PaymentModal } from '../components/PaymentModal';
 import { PrintDocumentModal } from '../components/PrintDocumentModal';
@@ -38,15 +40,39 @@ interface InvoicesPageProps {
   mode: 'client' | 'fournisseur';
 }
 
-const STATUS_LABELS: Record<ComputedInvoiceStatus, { label: string; colorClass: string }> = {
-  impayee: { label: 'Impayée', colorClass: 'text-slate-700' },
-  partielle: { label: 'Partielle', colorClass: 'text-amber-700' },
-  payee: { label: 'Payée', colorClass: 'text-emerald-700' },
-  en_retard: { label: 'En retard', colorClass: 'text-red-700 font-semibold' },
-  annulee: { label: 'Annulée', colorClass: 'text-slate-400 line-through' },
+const STATUS_LABELS: Record<
+  ComputedInvoiceStatus,
+  { label: string; colorClass: string; pillClass: string }
+> = {
+  impayee: {
+    label: 'Non payée',
+    colorClass: 'text-red-700',
+    pillClass: 'border-red-200 bg-red-50 text-red-700',
+  },
+  partielle: {
+    label: 'Partiellement payée',
+    colorClass: 'text-orange-700',
+    pillClass: 'border-orange-200 bg-orange-50 text-orange-700',
+  },
+  payee: {
+    label: 'Payée',
+    colorClass: 'text-emerald-700',
+    pillClass: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+  },
+  en_retard: {
+    label: 'En retard',
+    colorClass: 'text-red-700 font-semibold',
+    pillClass: 'border-red-300 bg-red-100 text-red-800',
+  },
+  annulee: {
+    label: 'Annulée',
+    colorClass: 'text-slate-400 line-through',
+    pillClass: 'border-slate-200 bg-slate-100 text-slate-500 line-through',
+  },
 };
 
 export const InvoicesPage: React.FC<InvoicesPageProps> = ({ mode }) => {
+  const navigate = useNavigate();
   const pushToast = useAppStore((s) => s.pushToast);
   const { isSimple } = useUiMode();
   const settings = useLiveQuery(() => db.settings.get('company_settings'));
@@ -97,6 +123,16 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({ mode }) => {
     number: string;
   } | null>(null);
   const [cancelReason, setCancelReason] = useState('');
+  const [statusPaymentTarget, setStatusPaymentTarget] = useState<{
+    invoice: CustomerInvoice;
+    targetStatus: 'payee' | 'partielle';
+    remainingCentimes: number;
+  } | null>(null);
+  const [unpayTarget, setUnpayTarget] = useState<{
+    id: string;
+    number: string;
+  } | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
   // Édition rapide inline sur N° BC / Réf / Notes
   const [inlineEdit, setInlineEdit] = useState<{
@@ -397,6 +433,45 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({ mode }) => {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {mode === 'client' && selectedIds.length > 0 && (
+            <button
+              type="button"
+              onClick={async () => {
+                const route = `/imprimer/lot-factures?ids=${encodeURIComponent(selectedIds.join(','))}`;
+                const ps = settings?.printSettings;
+                if (
+                  window.electronAPI?.isElectron &&
+                  ps &&
+                  !ps.previewBeforePrint &&
+                  window.electronAPI.printDirect
+                ) {
+                  const res = await window.electronAPI.printDirect({
+                    printRoute: route,
+                    printSettings: ps,
+                  });
+                  if (!res.ok) {
+                    pushToast({
+                      type: 'error',
+                      title: 'Impression du lot impossible',
+                      message: res.error || 'Aucune imprimante disponible.',
+                    });
+                  } else {
+                    pushToast({
+                      type: 'success',
+                      title: 'Impression lancée',
+                      message: `${selectedIds.length} facture(s) envoyée(s) vers l’imprimante.`,
+                    });
+                  }
+                  return;
+                }
+                navigate(route);
+              }}
+              className="inline-flex items-center gap-2 rounded-md border border-blue-300 bg-blue-50 px-3.5 py-2 text-sm font-medium text-[#1D4ED8] hover:bg-blue-100 whitespace-nowrap"
+            >
+              <Printer className="h-4 w-4" />
+              <span>Imprimer la sélection ({selectedIds.length})</span>
+            </button>
+          )}
           {mode === 'client' && (
             <button
               type="button"
@@ -467,6 +542,25 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({ mode }) => {
         <table className="w-full text-left text-xs">
           <thead className="border-b border-slate-200 bg-slate-50 font-semibold text-slate-600">
             <tr>
+              {mode === 'client' && (
+                <th className="w-8 px-2.5 py-2.5 text-center">
+                  <input
+                    type="checkbox"
+                    aria-label="Tout sélectionner"
+                    checked={
+                      enrichedRows.length > 0 &&
+                      enrichedRows.every((r) => selectedIds.includes(r.inv.id))
+                    }
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        setSelectedIds(enrichedRows.map((r) => r.inv.id));
+                      } else {
+                        setSelectedIds([]);
+                      }
+                    }}
+                  />
+                </th>
+              )}
               <th className="px-3 py-2.5">
                 <button
                   type="button"
@@ -526,7 +620,7 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({ mode }) => {
             {enrichedRows.length === 0 ? (
               <tr>
                 <td
-                  colSpan={isSimple ? (mode === 'client' ? 10 : 9) : mode === 'client' ? 13 : 12}
+                  colSpan={isSimple ? (mode === 'client' ? 11 : 9) : mode === 'client' ? 14 : 12}
                   className="px-4 py-8 text-center text-sm text-slate-500"
                 >
                   Aucune facture trouvée pour ces critères.
@@ -536,8 +630,29 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({ mode }) => {
               enrichedRows.map(({ inv, contactId, contactLabel, paid, remaining, computedStatus, issuerProfile }) => {
                 const statusMeta = STATUS_LABELS[computedStatus];
                 const isCancelled = computedStatus === 'annulee';
+                const dropdownStatus =
+                  computedStatus === 'payee'
+                    ? 'payee'
+                    : computedStatus === 'partielle'
+                    ? 'partielle'
+                    : 'impayee';
                 return (
                   <tr key={inv.id} className="hover:bg-slate-50">
+                    {mode === 'client' && (
+                      <td className="px-2.5 py-2.5 text-center">
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.includes(inv.id)}
+                          onChange={(e) => {
+                            setSelectedIds((prev) =>
+                              e.target.checked
+                                ? [...prev, inv.id]
+                                : prev.filter((id) => id !== inv.id)
+                            );
+                          }}
+                        />
+                      </td>
+                    )}
                     <td className="px-3 py-2.5 font-semibold text-slate-900 whitespace-nowrap">
                       <div className="inline-flex items-center gap-1.5">
                         <span>{inv.invoiceNumber}</span>
@@ -670,18 +785,61 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({ mode }) => {
                     <td className="px-3 py-2.5 text-right font-semibold text-red-700 tabular-nums whitespace-nowrap">
                       {formatMoney(remaining, inv.currency)}
                     </td>
-                    <td className={`px-3 py-2.5 whitespace-nowrap ${statusMeta.colorClass}`}>
-                      {statusMeta.label}
+                    <td className="px-3 py-2.5 whitespace-nowrap">
+                      <div className="inline-flex items-center gap-1.5">
+                        <span
+                          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${statusMeta.pillClass}`}
+                        >
+                          {statusMeta.label}
+                        </span>
+                        {mode === 'client' && !isCancelled && (
+                          <select
+                            aria-label={`Changer le statut de ${inv.invoiceNumber}`}
+                            value={dropdownStatus}
+                            onChange={(e) => {
+                              const next = e.target.value as 'impayee' | 'partielle' | 'payee';
+                              if (next === 'impayee') {
+                                if (paid > 0) {
+                                  setUnpayTarget({ id: inv.id, number: inv.invoiceNumber });
+                                }
+                              } else if (remaining > 0) {
+                                setStatusPaymentTarget({
+                                  invoice: inv as CustomerInvoice,
+                                  targetStatus: next,
+                                  remainingCentimes: remaining,
+                                });
+                              }
+                            }}
+                            className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] text-slate-700 hover:border-slate-300"
+                          >
+                            <option value="impayee">Non payée</option>
+                            <option value="partielle">Partielle</option>
+                            <option value="payee">Payée</option>
+                          </select>
+                        )}
+                      </div>
                     </td>
                     <td className="px-3 py-2.5 text-right whitespace-nowrap">
                       <div className="inline-flex items-center gap-1">
                         {!isCancelled && remaining > 0 && (
                           <button
                             type="button"
-                            onClick={() =>
-                              setPaymentTarget({ contactId, invoiceId: inv.id })
+                            onClick={() => {
+                              if (mode === 'client') {
+                                setStatusPaymentTarget({
+                                  invoice: inv as CustomerInvoice,
+                                  targetStatus: 'partielle',
+                                  remainingCentimes: remaining,
+                                });
+                              } else {
+                                setPaymentTarget({ contactId, invoiceId: inv.id });
+                              }
+                            }}
+                            title={
+                              mode === 'client'
+                                ? 'Ajouter un paiement / avance'
+                                : 'Régler facture'
                             }
-                            title={mode === 'client' ? 'Enregistrer paiement' : 'Régler facture'}
                             className="rounded p-1 text-emerald-700 hover:bg-emerald-50"
                           >
                             <Wallet className="h-3.5 w-3.5" />
@@ -793,6 +951,64 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({ mode }) => {
           preselectedInvoiceId={paymentTarget.invoiceId}
           onClose={() => setPaymentTarget(null)}
         />
+      )}
+
+      {mode === 'client' && statusPaymentTarget && (
+        <InvoiceStatusPaymentModal
+          open={Boolean(statusPaymentTarget)}
+          invoice={statusPaymentTarget.invoice}
+          targetStatus={statusPaymentTarget.targetStatus}
+          remainingCentimes={statusPaymentTarget.remainingCentimes}
+          onClose={() => setStatusPaymentTarget(null)}
+        />
+      )}
+
+      {unpayTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-6 shadow-xl space-y-4">
+            <h3 className="text-base font-semibold text-slate-900">
+              Repasser la facture {unpayTarget.number} en « Non payée » ?
+            </h3>
+            <p className="text-xs text-slate-600">
+              Les règlements enregistrés pour cette facture seront annulés et conservés dans la Corbeille (restaurables à tout moment).
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setUnpayTarget(null)}
+                className="rounded-md border border-slate-300 bg-white px-4 py-2 text-xs font-medium text-slate-700"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await revertInvoiceToUnpaid({
+                      invoiceType: mode,
+                      invoiceId: unpayTarget.id,
+                    });
+                    pushToast({
+                      type: 'info',
+                      title: 'Facture repassée en « Non payée »',
+                      message: 'Les paiements associés ont été annulés (récupérables dans la Corbeille).',
+                    });
+                    setUnpayTarget(null);
+                  } catch (err) {
+                    pushToast({
+                      type: 'error',
+                      title: 'Erreur',
+                      message: err instanceof Error ? err.message : 'Impossible de modifier le statut.',
+                    });
+                  }
+                }}
+                className="rounded-md bg-red-600 px-4 py-2 text-xs font-semibold text-white hover:bg-red-700"
+              >
+                Confirmer
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Modale Annulation avec motif obligatoire */}

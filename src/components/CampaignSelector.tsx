@@ -36,10 +36,8 @@ export const CampaignSelector: React.FC<CampaignSelectorProps> = ({
 
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
-  const [qStart, setQStart] = useState(new Date().toISOString().slice(0, 10));
-  const [qEnd, setQEnd] = useState(
-    new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10)
-  );
+  const [qStart, setQStart] = useState('');
+  const [qEnd, setQEnd] = useState('');
   const [creating, setCreating] = useState(false);
 
   const suggestions = useMemo(() => {
@@ -103,7 +101,10 @@ export const CampaignSelector: React.FC<CampaignSelectorProps> = ({
       pushToast({
         type: 'success',
         title: 'Campagne créée',
-        message: `${created.name} (${formatDateFr(created.startDate)} → ${formatDateFr(created.endDate)})`,
+        message:
+          created.startDate && created.endDate
+            ? `${created.name} (${formatDateFr(created.startDate)} → ${formatDateFr(created.endDate)})`
+            : created.name,
       });
     } catch (err) {
       pushToast({
@@ -202,7 +203,7 @@ export const CampaignSelector: React.FC<CampaignSelectorProps> = ({
           </div>
           <div className="grid grid-cols-2 gap-2">
             <div>
-              <label className="block text-[11px] text-slate-600">Date début *</label>
+              <label className="block text-[11px] text-slate-600">Date début (optionnel)</label>
               <input
                 type="date"
                 value={qStart}
@@ -211,7 +212,7 @@ export const CampaignSelector: React.FC<CampaignSelectorProps> = ({
               />
             </div>
             <div>
-              <label className="block text-[11px] text-slate-600">Date fin *</label>
+              <label className="block text-[11px] text-slate-600">Date fin (optionnel)</label>
               <input
                 type="date"
                 value={qEnd}
@@ -228,7 +229,7 @@ export const CampaignSelector: React.FC<CampaignSelectorProps> = ({
               className="inline-flex items-center gap-1 rounded bg-[#0F1E36] px-3 py-1 text-xs font-medium text-white hover:bg-[#1a2f52]"
             >
               <Plus className="h-3.5 w-3.5" />
-              <span>{creating ? 'Création...' : 'Créer & remplir les dates'}</span>
+              <span>{creating ? 'Création...' : 'Créer la campagne'}</span>
             </button>
           </div>
         </div>

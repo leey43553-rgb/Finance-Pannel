@@ -835,6 +835,7 @@ import {
 } from '../constants/companyPresets';
 import {
   computeTemplatePageChunks,
+  getEffectiveCampaignStatus,
   resolveEffectiveCompanyProfile,
 } from '../utils/documentHelpers';
 import { formatMoneyNumberOnly, formatQuantityFr } from '../utils/money';
@@ -1917,6 +1918,246 @@ describe('Import Bon de Commande — Stage 2 (brouillon, contacts, doublons, sé
     expect(readerSource).not.toMatch(/https?:\/\//i);
   });
 });
+
+describe('Mise à jour complète — Statuts factures, Chèques/avances, Campagnes, Isolation PDF et Impression', () => {
+  it('Part 1 : calcule correctement les statuts Payée / Partielle / Non payée / En retard / Annulée', () => {
+    expect(
+      computeInvoiceStatus({
+        storedStatus: 'impayee',
+        totalTtcCentimes: 11900000,
+        paidCentimes: 0,
+        dueDate: '2026-12-31',
+        referenceDate: '2026-08-20',
+      })
+    ).toBe('impayee');
+
+    expect(
+      computeInvoiceStatus({
+        storedStatus: 'impayee',
+        totalTtcCentimes: 11900000,
+        paidCentimes: 5000000,
+        dueDate: '2026-12-31',
+        referenceDate: '2026-08-20',
+      })
+    ).toBe('partielle');
+
+    expect(
+      computeInvoiceStatus({
+        storedStatus: 'partielle',
+        totalTtcCentimes: 11900000,
+        paidCentimes: 11900000,
+        dueDate: '2026-08-01',
+        referenceDate: '2026-08-20',
+      })
+    ).toBe('payee');
+
+    expect(
+      computeInvoiceStatus({
+        storedStatus: 'impayee',
+        totalTtcCentimes: 11900000,
+        paidCentimes: 5000000,
+        dueDate: '2026-08-01',
+        referenceDate: '2026-08-20',
+      })
+    ).toBe('en_retard');
+
+    expect(
+      computeInvoiceStatus({
+        storedStatus: 'annulee',
+        totalTtcCentimes: 11900000,
+        paidCentimes: 0,
+        dueDate: '2026-08-01',
+        referenceDate: '2026-08-20',
+      })
+    ).toBe('annulee');
+  });
+
+  it('Part 2 : comptabilise les chèques d’avance en attente et les paiements versement dans le compte client', () => {
+    const summary = computeContactAccountSummary({
+      contactId: 'cli-1',
+      direction: 'client',
+      invoices: [
+        {
+          id: 'inv-1',
+          contactId: 'cli-1',
+          totalTtcCentimes: 20000000,
+          baseDzdTtcCentimes: 20000000,
+          status: 'impayee',
+        },
+      ],
+      payments: [
+        {
+          id: 'pay-1',
+          direction: 'entrant',
+          contactId: 'cli-1',
+          date: '2026-08-10',
+          amountCentimes: 5000000,
+          currency: 'DZD',
+          exchangeRate: 1,
+          baseDzdAmountCentimes: 5000000,
+          method: 'versement',
+          bankAccountId: 'bank-1',
+          reference: 'VIR-01',
+          notes: '',
+          isAdvance: true,
+          status: 'valide',
+          createdAt: '',
+          updatedAt: '',
+        },
+      ],
+      allocations: [],
+      incomingCheques: [
+        {
+          id: 'chq-adv',
+          clientId: 'cli-1',
+          status: 'en_attente',
+          isAdvance: true,
+          allocatedInvoiceIds: [],
+          baseDzdAmountCentimes: 8000000,
+        },
+        {
+          id: 'chq-rej',
+          clientId: 'cli-1',
+          status: 'rejete',
+          isAdvance: true,
+          allocatedInvoiceIds: [],
+          baseDzdAmountCentimes: 3000000,
+        },
+      ],
+    });
+
+    expect(summary.totalInvoicedBaseDzd).toBe(20000000);
+    expect(summary.totalUnpaidBaseDzd).toBe(20000000);
+    expect(summary.pendingAdvanceChequesBaseDzd).toBe(8000000);
+    // 50 000 DA paiement non affecté + 80 000 DA chèque d'avance en attente (hors chèque rejeté)
+    expect(summary.availableAdvanceBaseDzd).toBe(13000000);
+  });
+
+  it('Part 3 : autorise les campagnes sans dates imposées et respecte le statut choisi manuellement', () => {
+    expect(computeCampaignDuration('', '')).toEqual({
+      valid: true,
+      days: 0,
+      monthsFloat: 0,
+      label: '—',
+    });
+    expect(suggestCampaignStatus('', '')).toBe('prevue');
+    expect(
+      getEffectiveCampaignStatus(
+        { startDate: '2026-01-01', endDate: '2026-01-31', status: 'en_cours' },
+        '2026-08-20'
+      )
+    ).toBe('en_cours');
+  });
+
+  it('Part 4 : isolateElementForPdfClone supprime barre latérale/modale/frères et buildStandaloneReportHtml reste 100% hors-ligne', async () => {
+    const {
+      isolateElementForPdfClone,
+      buildStandaloneReportHtml,
+      resolvePaperDimensionsMm,
+    } = await import('../utils/print');
+
+    const removedNodes: string[] = [];
+    const makeNode = (id: string, tagName = 'DIV') => ({
+      id,
+      nodeType: 1,
+      tagName,
+      style: {} as Record<string, string>,
+      parentElement: null as unknown,
+      parentNode: null as unknown,
+      childNodes: [] as unknown[],
+    });
+
+    const body = makeNode('body', 'BODY');
+    const sidebar = makeNode('sidebar', 'ASIDE');
+    const modalBackdrop = makeNode('modal', 'DIV');
+    const modalToolbar = makeNode('toolbar', 'DIV');
+    const targetDoc = makeNode('doc-a4', 'DIV');
+    const toast = makeNode('toast', 'DIV');
+
+    const attach = (parent: ReturnType<typeof makeNode>, child: ReturnType<typeof makeNode>) => {
+      child.parentElement = parent;
+      child.parentNode = {
+        removeChild: (n: ReturnType<typeof makeNode>) => {
+          removedNodes.push(n.id);
+          parent.childNodes = parent.childNodes.filter((c) => c !== n);
+        },
+      };
+      parent.childNodes.push(child);
+    };
+
+    attach(body, sidebar);
+    attach(body, modalBackdrop);
+    attach(body, toast);
+    attach(modalBackdrop, modalToolbar);
+    attach(modalBackdrop, targetDoc);
+
+    const fakeDoc = {
+      body: body as unknown as HTMLElement,
+      documentElement: makeNode('html', 'HTML') as unknown as HTMLElement,
+    } as unknown as Document;
+
+    isolateElementForPdfClone(fakeDoc, targetDoc as unknown as HTMLElement);
+
+    expect(removedNodes).toContain('sidebar');
+    expect(removedNodes).toContain('toast');
+    expect(removedNodes).toContain('toolbar');
+    expect(removedNodes).not.toContain('doc-a4');
+    expect(modalBackdrop.childNodes).toEqual([targetDoc]);
+    expect(body.childNodes).toEqual([modalBackdrop]);
+    expect(modalBackdrop.style.background).toBe('#ffffff');
+    expect(modalBackdrop.style.transform).toBe('none');
+
+    const reportHtml = buildStandaloneReportHtml({
+      title: 'Factures impayées',
+      filterSummary: 'Période : 2026-01-01 → 2026-12-31',
+      columns: [
+        { key: 'num', header: 'N°' },
+        { key: 'total', header: 'Total TTC', type: 'number' },
+      ],
+      rows: [{ num: '078/26', total: '624 750,00 DA' }],
+      totalsRow: { num: 'TOTAL', total: '624 750,00 DA' },
+      summaryCards: [{ label: 'Reste dû', value: '624 750,00 DA', tone: 'red' }],
+    });
+
+    expect(reportHtml).toContain('Factures impayées');
+    expect(reportHtml).toContain('078/26');
+    expect(reportHtml).toContain('624 750,00 DA');
+    expect(reportHtml).not.toMatch(/https?:\/\//i);
+
+    expect(resolvePaperDimensionsMm('A4', false)).toEqual({ widthMm: 210, heightMm: 297 });
+    expect(resolvePaperDimensionsMm('A4', true)).toEqual({ widthMm: 297, heightMm: 210 });
+    expect(resolvePaperDimensionsMm('A5', false)).toEqual({ widthMm: 148, heightMm: 210 });
+  });
+
+  it('Part 5 : fournit les paramètres d’impression par défaut et le HTML de test hors-ligne', async () => {
+    const { DEFAULT_PRINT_SETTINGS } = await import('../db/database');
+    const { buildPrintTestHtml } = await import('../utils/print');
+
+    expect(DEFAULT_PRINT_SETTINGS).toEqual({
+      defaultPrinterName: '',
+      paperSize: 'A4',
+      orientation: 'portrait',
+      margins: 'none',
+      color: true,
+      copies: 1,
+      fitToPage: true,
+      previewBeforePrint: true,
+      silentPrint: false,
+    });
+
+    const testHtml = buildPrintTestHtml(undefined, undefined, {
+      ...DEFAULT_PRINT_SETTINGS,
+      defaultPrinterName: 'HP LaserJet Pro',
+      orientation: 'landscape',
+      copies: 2,
+    });
+    expect(testHtml).toContain('HP LaserJet Pro');
+    expect(testHtml).toContain('Paysage');
+    expect(testHtml).toContain('2 copie(s)');
+    expect(testHtml).not.toMatch(/https?:\/\//i);
+  });
+});
+
 
 
 

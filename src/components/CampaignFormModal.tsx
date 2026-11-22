@@ -28,35 +28,53 @@ export const CampaignFormModal: React.FC<CampaignFormModalProps> = ({
     [],
     []
   );
+  const profiles = useLiveQuery(
+    () => db.companyProfiles.filter((p) => !p.deletedAt).toArray(),
+    [],
+    []
+  );
+  const settings = useLiveQuery(() => db.settings.get('company_settings'));
 
   const [name, setName] = useState('');
   const [clientId, setClientId] = useState('');
+  const [companyProfileId, setCompanyProfileId] = useState('');
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [status, setStatus] = useState<CampaignStatus>('en_cours');
+  const [statusManuallyEdited, setStatusManuallyEdited] = useState(false);
   const [notes, setNotes] = useState('');
+  const [propagateToLinkedDocs, setPropagateToLinkedDocs] = useState(true);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setError('');
-    const today = new Date().toISOString().slice(0, 10);
-    const in60Days = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10);
+    const activeProf =
+      profiles.find((p) => p.id === settings?.activeCompanyProfileId) ||
+      profiles.find((p) => p.isDefault) ||
+      profiles[0];
+
     if (existingCampaign) {
       setName(existingCampaign.name);
       setClientId(existingCampaign.clientId);
-      setStartDate(existingCampaign.startDate);
-      setEndDate(existingCampaign.endDate);
+      setCompanyProfileId(existingCampaign.companyProfileId || activeProf?.id || '');
+      setStartDate(existingCampaign.startDate || '');
+      setEndDate(existingCampaign.endDate || '');
       setStatus(existingCampaign.status);
+      setStatusManuallyEdited(true);
       setNotes(existingCampaign.notes || '');
+      setPropagateToLinkedDocs(true);
     } else {
       setName('');
       setClientId(preselectedClientId || '');
-      setStartDate(today);
-      setEndDate(in60Days);
-      setStatus(suggestCampaignStatus(today, in60Days));
+      setCompanyProfileId(activeProf?.id || '');
+      setStartDate('');
+      setEndDate('');
+      setStatus('en_cours');
+      setStatusManuallyEdited(false);
       setNotes('');
+      setPropagateToLinkedDocs(true);
     }
   }, [open, existingCampaign, preselectedClientId]);
 
@@ -78,7 +96,7 @@ export const CampaignFormModal: React.FC<CampaignFormModalProps> = ({
   const handleDatesChange = (nextStart: string, nextEnd: string) => {
     setStartDate(nextStart);
     setEndDate(nextEnd);
-    if (status !== 'annulee' && nextStart && nextEnd) {
+    if (!existingCampaign && !statusManuallyEdited && status !== 'annulee' && nextStart && nextEnd) {
       setStatus(suggestCampaignStatus(nextStart, nextEnd));
     }
   };
@@ -92,14 +110,19 @@ export const CampaignFormModal: React.FC<CampaignFormModalProps> = ({
     }
     setBusy(true);
     try {
+      const clientChanged =
+        Boolean(existingCampaign) && existingCampaign?.clientId !== clientId;
       const saved = await saveCampaign({
         existingId: existingCampaign?.id,
         name,
         clientId,
+        companyProfileId: companyProfileId || undefined,
         startDate,
         endDate,
         status,
         notes,
+        propagateToLinkedDocs: Boolean(existingCampaign && propagateToLinkedDocs),
+        propagateClient: Boolean(existingCampaign && propagateToLinkedDocs && clientChanged),
       });
       pushToast({
         type: 'success',
@@ -120,7 +143,7 @@ export const CampaignFormModal: React.FC<CampaignFormModalProps> = ({
       <div className="w-full max-w-lg rounded-lg border border-slate-200 bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-slate-200 bg-[#0F1E36] px-6 py-4 text-white">
           <h2 className="text-base font-semibold">
-            {existingCampaign ? `Modifier ${existingCampaign.name}` : 'Nouvelle campagne'}
+            {existingCampaign ? `Modifier « ${existingCampaign.name} »` : 'Nouvelle campagne'}
           </h2>
           <button
             type="button"
@@ -150,39 +173,63 @@ export const CampaignFormModal: React.FC<CampaignFormModalProps> = ({
             />
           </div>
 
-          <div>
-            <label className="block text-xs font-medium text-slate-700">Client *</label>
-            <select
-              required
-              value={clientId}
-              onChange={(e) => setClientId(e.target.value)}
-              className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
-            >
-              <option value="">— Sélectionner un client —</option>
-              {clientOptions.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.company || c.name}
-                </option>
-              ))}
-            </select>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label className="block text-xs font-medium text-slate-700">Client *</label>
+              <select
+                required
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">— Sélectionner un client —</option>
+                {clientOptions.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.company || c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {profiles.length > 0 && (
+              <div>
+                <label className="block text-xs font-medium text-slate-700">
+                  Société associée
+                </label>
+                <select
+                  value={companyProfileId}
+                  onChange={(e) => setCompanyProfileId(e.target.value)}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+                >
+                  <option value="">— Aucune / Par défaut —</option>
+                  {profiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-medium text-slate-700">Date de début *</label>
+              <label className="block text-xs font-medium text-slate-700">
+                Date de début (optionnel)
+              </label>
               <input
                 type="date"
-                required
                 value={startDate}
                 onChange={(e) => handleDatesChange(e.target.value, endDate)}
                 className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-700">Date de fin *</label>
+              <label className="block text-xs font-medium text-slate-700">
+                Date de fin (optionnel)
+              </label>
               <input
                 type="date"
-                required
                 value={endDate}
                 onChange={(e) => handleDatesChange(startDate, e.target.value)}
                 className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
@@ -197,16 +244,21 @@ export const CampaignFormModal: React.FC<CampaignFormModalProps> = ({
                 : 'border-red-200 bg-red-50 text-red-700'
             }`}
           >
-            {duration.valid
+            {!duration.valid
+              ? duration.label
+              : startDate && endDate
               ? `Durée calculée : ${duration.label} (${duration.days} jours)`
-              : duration.label}
+              : 'Dates non définies (vous pourrez les compléter plus tard)'}
           </div>
 
           <div>
             <label className="block text-xs font-medium text-slate-700">Statut</label>
             <select
               value={status}
-              onChange={(e) => setStatus(e.target.value as CampaignStatus)}
+              onChange={(e) => {
+                setStatus(e.target.value as CampaignStatus);
+                setStatusManuallyEdited(true);
+              }}
               className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
             >
               <option value="prevue">Prévue</option>
@@ -225,6 +277,17 @@ export const CampaignFormModal: React.FC<CampaignFormModalProps> = ({
               className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
             />
           </div>
+
+          {existingCampaign && (
+            <label className="flex cursor-pointer items-center gap-2 rounded-md border border-blue-200 bg-blue-50/70 px-3 py-2 text-xs text-slate-800">
+              <input
+                type="checkbox"
+                checked={propagateToLinkedDocs}
+                onChange={(e) => setPropagateToLinkedDocs(e.target.checked)}
+              />
+              <span>Appliquer aussi aux documents liés (BC, proformas, factures)</span>
+            </label>
+          )}
 
           <div className="flex justify-end gap-2 border-t border-slate-200 pt-4">
             <button

@@ -41,7 +41,12 @@ import {
   computePaymentUnallocatedCentimes,
 } from '../utils/finance';
 import { addMoney, formatMoney, subtractMoney } from '../utils/money';
-import { buildPdfFileName, printCurrentViewAsPdf } from '../utils/print';
+import {
+  buildPdfFileName,
+  buildStandaloneReportHtml,
+  printCurrentViewAsPdf,
+  printWithSettings,
+} from '../utils/print';
 import { useUiMode } from '../hooks/useUiMode';
 import { computeBcRecuInvoicingStatus, formatDateFr } from '../utils/documentHelpers';
 
@@ -1220,8 +1225,22 @@ export const ReportsPage: React.FC = () => {
                 setIsExportingPdf(true);
                 try {
                   const fileName = buildPdfFileName('rapport', `${reportType}-${today}`);
+                  const ps = settings?.printSettings;
+                  const htmlContent = buildStandaloneReportHtml({
+                    title: reportData.title,
+                    filterSummary: reportData.filterSummary,
+                    columns: reportData.columns,
+                    rows: reportData.rows,
+                    totalsRow: reportData.totalsRow,
+                    summaryCards: reportData.summaryCards,
+                    settings,
+                    printSettings: ps,
+                  });
                   const res = await printCurrentViewAsPdf(fileName, {
                     companyName: settings?.companyName,
+                    landscape: ps?.orientation === 'landscape',
+                    paperSize: ps?.paperSize || 'A4',
+                    htmlContent,
                     element: reportPrintRef.current,
                   });
                   if (!res.ok) {
@@ -1260,11 +1279,44 @@ export const ReportsPage: React.FC = () => {
               {isExportingPdf ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
-                <Printer className="h-4 w-4" />
+                <Download className="h-4 w-4" />
               )}
-              <span>
-                {isExportingPdf ? 'Génération du PDF…' : 'Exporter PDF / Imprimer (A4)'}
-              </span>
+              <span>{isExportingPdf ? 'Génération du PDF…' : 'Exporter PDF (A4)'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={async () => {
+                const ps = settings?.printSettings;
+                const htmlContent = buildStandaloneReportHtml({
+                  title: reportData.title,
+                  filterSummary: reportData.filterSummary,
+                  columns: reportData.columns,
+                  rows: reportData.rows,
+                  totalsRow: reportData.totalsRow,
+                  summaryCards: reportData.summaryCards,
+                  settings,
+                  printSettings: ps,
+                });
+                const printRes = await printWithSettings({
+                  htmlContent,
+                  printSettings: ps,
+                });
+                if (!printRes.ok) {
+                  pushToast({
+                    type: 'warning',
+                    title: printRes.blockedByIframe
+                      ? 'Impression bloquée par l’aperçu'
+                      : 'Impression impossible',
+                    message:
+                      printRes.error ||
+                      "Utilisez « Exporter PDF (A4) » ou ouvrez l'application dans un onglet séparé.",
+                  });
+                }
+              }}
+              className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Printer className="h-4 w-4" />
+              <span>Imprimer</span>
             </button>
           </div>
         )}

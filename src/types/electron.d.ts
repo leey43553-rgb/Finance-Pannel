@@ -6,6 +6,25 @@ export interface ElectronBackupFile {
   kind: 'auto' | 'manual';
 }
 
+export interface ElectronPrinterInfo {
+  name: string;
+  displayName?: string;
+  description?: string;
+  isDefault?: boolean;
+  status?: number;
+}
+
+export interface ElectronPrintSettingsPayload {
+  defaultPrinterName?: string;
+  paperSize?: 'A4' | 'A5' | 'Letter';
+  orientation?: 'portrait' | 'landscape';
+  margins?: 'none' | 'default' | 'minimum';
+  color?: boolean;
+  copies?: number;
+  fitToPage?: boolean;
+  silentPrint?: boolean;
+}
+
 export interface ElectronAPI {
   isElectron: boolean;
   saveBackup: (
@@ -37,6 +56,9 @@ export interface ElectronAPI {
     companyName?: string;
     landscape?: boolean;
     rawLayout?: boolean;
+    printRoute?: string;
+    htmlContent?: string;
+    paperSize?: 'A4' | 'A5' | 'Letter';
   }) => Promise<{
     ok: boolean;
     canceled?: boolean;
@@ -47,7 +69,16 @@ export interface ElectronAPI {
     ok: boolean;
     error?: string;
   }>;
-  printDirect: () => Promise<{
+  getPrinters: () => Promise<{
+    ok: boolean;
+    printers?: ElectronPrinterInfo[];
+    error?: string;
+  }>;
+  printDirect: (options?: {
+    printRoute?: string;
+    htmlContent?: string;
+    printSettings?: ElectronPrintSettingsPayload;
+  }) => Promise<{
     ok: boolean;
     error?: string;
   }>;

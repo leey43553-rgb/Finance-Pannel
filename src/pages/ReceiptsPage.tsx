@@ -15,6 +15,7 @@ const METHOD_LABELS: Record<PaymentMethod, string> = {
   cheque: 'Chèque',
   virement: 'Virement',
   carte: 'Carte',
+  versement: 'Versement',
 };
 
 export const ReceiptsPage: React.FC = () => {

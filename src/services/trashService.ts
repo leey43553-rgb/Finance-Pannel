@@ -296,10 +296,26 @@ export async function restoreFromTrash(
     }
     case 'payment': {
       const pay = await db.payments.get(id);
-      await db.payments.update(id, { deletedAt: undefined, updatedAt: now });
-      if (pay && pay.status === 'valide') {
+      const shouldRevalidate = Boolean(pay && pay.deletedAt && pay.status === 'annule');
+      await db.payments.update(id, {
+        deletedAt: undefined,
+        ...(shouldRevalidate
+          ? { status: 'valide', cancelReason: undefined, cancelledAt: undefined }
+          : {}),
+        updatedAt: now,
+      });
+      if (pay && (pay.status === 'valide' || shouldRevalidate)) {
         const leds = await db.ledgerEntries.where('sourceId').equals(id).toArray();
         for (const l of leds) await db.ledgerEntries.update(l.id, { status: 'valide' });
+        if (pay.chequeId) {
+          const chqLeds = await db.ledgerEntries.where('sourceId').equals(pay.chequeId).toArray();
+          for (const l of chqLeds) await db.ledgerEntries.update(l.id, { status: 'valide' });
+        }
+        const allocs = await db.paymentAllocations.where('paymentId').equals(id).toArray();
+        const { refreshInvoiceStoredStatus } = await import('./financeActions');
+        for (const a of allocs) {
+          await refreshInvoiceStoredStatus(a.invoiceType, a.invoiceId);
+        }
       }
       break;
     }

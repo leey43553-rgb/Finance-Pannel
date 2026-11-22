@@ -2,7 +2,7 @@ export type UIMode = 'simple' | 'avance';
 
 export type ContactType = 'client' | 'fournisseur' | 'les_deux';
 
-export type PaymentMethod = 'especes' | 'cheque' | 'virement' | 'carte';
+export type PaymentMethod = 'especes' | 'cheque' | 'virement' | 'carte' | 'versement';
 
 export type StoredInvoiceStatus = 'impayee' | 'partielle' | 'payee' | 'annulee';
 export type ComputedInvoiceStatus = StoredInvoiceStatus | 'en_retard';
@@ -91,6 +91,22 @@ export interface OutdoorCatalogConfig {
   locations: string[];
 }
 
+export type PrintPaperSize = 'A4' | 'A5' | 'Letter';
+export type PrintOrientation = 'portrait' | 'landscape';
+export type PrintMarginMode = 'none' | 'default' | 'minimum';
+
+export interface PrintSettings {
+  defaultPrinterName: string;
+  paperSize: PrintPaperSize;
+  orientation: PrintOrientation;
+  margins: PrintMarginMode;
+  color: boolean;
+  copies: number;
+  fitToPage: boolean;
+  previewBeforePrint: boolean;
+  silentPrint: boolean;
+}
+
 export interface CompanySettings {
   id: 'company_settings';
   companyName: string;
@@ -120,6 +136,7 @@ export interface CompanySettings {
   appVersion: string;
   isDemoDataLoaded: boolean;
   outdoorCatalog?: OutdoorCatalogConfig;
+  printSettings?: PrintSettings;
   updatedAt: string;
 }
 
@@ -275,6 +292,7 @@ export interface Campaign {
   id: string;
   name: string;
   clientId: string;
+  companyProfileId?: string;
   startDate: string;
   endDate: string;
   status: CampaignStatus;
@@ -468,9 +486,13 @@ export interface IncomingCheque {
   depositDate?: string;
   clearingDate?: string;
   status: IncomingChequeStatus;
+  isAdvance?: boolean;
   linkedPaymentId?: string;
   allocatedInvoiceIds: string[];
+  allocatedAmounts?: Record<string, number>;
   notes: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
   cancelReason?: string;
   cancelledAt?: string;
   deletedAt?: string;
@@ -497,6 +519,8 @@ export interface OutgoingCheque {
   clearingDate?: string;
   status: OutgoingChequeStatus;
   notes: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
   cancelReason?: string;
   cancelledAt?: string;
   deletedAt?: string;

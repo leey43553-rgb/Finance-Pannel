@@ -172,7 +172,7 @@ export async function saveCustomerInvoice(params: {
     bcNumber: params.bcNumber.trim(),
     linkedBcRecuId: params.linkedBcRecuId || existing?.linkedBcRecuId,
     proformaId: params.proformaId || existing?.proformaId,
-    campaignId: params.campaignId || existing?.campaignId,
+    campaignId: 'campaignId' in params ? params.campaignId || undefined : existing?.campaignId,
     campaignRef: params.campaignRef.trim(),
     campaignStartDate: params.campaignStartDate || undefined,
     campaignEndDate: params.campaignEndDate || undefined,
@@ -445,7 +445,7 @@ export async function cancelInvoice(params: {
   }
 }
 
-async function refreshInvoiceStoredStatus(
+export async function refreshInvoiceStoredStatus(
   invoiceType: 'client' | 'fournisseur',
   invoiceId: string
 ): Promise<void> {
@@ -801,6 +801,355 @@ export async function cancelPayment(paymentId: string, reason: string): Promise<
     before: payment,
     reason: reason.trim(),
   });
+}
+
+/**
+ * Enregistre un règlement rapide ou une avance sur une facture client (Payée / Partiellement payée).
+ * Gère les modes Espèces, Virement, Versement, Carte, ainsi que Chèque (nouveau chèque reçu ou chèque reçu existant).
+ */
+export async function recordInvoiceStatusPayment(params: {
+  invoiceId: string;
+  date: string;
+  amountCentimes: number;
+  method: PaymentMethod;
+  bankAccountId: string | null;
+  reference?: string;
+  notes?: string;
+  // Options chèque
+  existingChequeId?: string;
+  chequeNumber?: string;
+  issuerBank?: string;
+  chequeDate?: string;
+}): Promise<{ paymentId: string; chequeId?: string }> {
+  const invoice = await db.customerInvoices.get(params.invoiceId);
+  if (!invoice || invoice.deletedAt) throw new Error('Facture introuvable.');
+  if (invoice.status === 'annulee') throw new Error('Une facture annulée ne peut pas être réglée.');
+  if (!params.date) throw new Error('La date de paiement est obligatoire.');
+  if (params.amountCentimes <= 0) throw new Error('Le montant du paiement doit être supérieur à zéro.');
+
+  const allAllocs = await db.paymentAllocations.where('invoiceId').equals(invoice.id).toArray();
+  const allPays = await db.payments.toArray();
+  const validPayIds = new Set(
+    allPays.filter((p) => p.status === 'valide' && !p.deletedAt).map((p) => p.id)
+  );
+  const alreadyPaid = computeInvoicePaidCentimes(invoice.id, allAllocs, validPayIds);
+  const remaining = Math.max(0, invoice.totalTtcCentimes - alreadyPaid);
+  if (remaining <= 0) {
+    throw new Error('Cette facture est déjà entièrement payée.');
+  }
+  if (params.amountCentimes > remaining) {
+    throw new Error('Le montant saisi dépasse le reste à payer sur cette facture.');
+  }
+
+  const now = new Date().toISOString();
+  const contact = await db.contacts.get(invoice.clientId);
+  const contactLabel = contact ? contact.company || contact.name : invoice.clientSnapshot?.company || 'Client';
+
+  if (params.method === 'cheque') {
+    if (params.existingChequeId) {
+      const cheque = await db.incomingCheques.get(params.existingChequeId);
+      if (!cheque || cheque.deletedAt) throw new Error('Chèque reçu introuvable.');
+      if (cheque.status === 'rejete' || cheque.status === 'annule') {
+        throw new Error('Ce chèque est rejeté ou annulé.');
+      }
+
+      // Cas 1 : le chèque était déjà encaissé avec un paiement d'avance disponible
+      if (cheque.linkedPaymentId) {
+        const pay = await db.payments.get(cheque.linkedPaymentId);
+        if (!pay || pay.status !== 'valide' || pay.deletedAt) {
+          throw new Error('Le paiement lié à ce chèque n’est plus valide.');
+        }
+        await allocateExistingAdvanceToInvoices({
+          paymentId: pay.id,
+          invoiceType: 'client',
+          allocations: [{ invoiceId: invoice.id, amountCentimes: params.amountCentimes }],
+        });
+        const nextAllocatedIds = Array.from(new Set([...cheque.allocatedInvoiceIds, invoice.id]));
+        const nextAmounts = {
+          ...(cheque.allocatedAmounts || {}),
+          [invoice.id]: ((cheque.allocatedAmounts || {})[invoice.id] || 0) + params.amountCentimes,
+        };
+        const payAllocs = await db.paymentAllocations.where('paymentId').equals(pay.id).toArray();
+        const totalUsed = payAllocs.reduce((s, a) => s + a.amountCentimes, 0);
+        await db.incomingCheques.update(cheque.id, {
+          allocatedInvoiceIds: nextAllocatedIds,
+          allocatedAmounts: nextAmounts,
+          isAdvance: totalUsed < pay.amountCentimes,
+          updatedAt: now,
+        });
+        return { paymentId: pay.id, chequeId: cheque.id };
+      }
+
+      // Cas 2 : le chèque existant était en attente -> on l'encaisse avec affectation sur cette facture
+      const targetBank = params.bankAccountId ?? cheque.targetBankAccountId ?? null;
+      const payId = createId('pay');
+      const allocAmt = Math.min(params.amountCentimes, cheque.amountCentimes);
+      const isAdvance = allocAmt < cheque.amountCentimes;
+      const payment: Payment = {
+        id: payId,
+        direction: 'entrant',
+        contactId: invoice.clientId,
+        date: params.date,
+        amountCentimes: cheque.amountCentimes,
+        currency: cheque.currency,
+        exchangeRate: cheque.exchangeRate,
+        baseDzdAmountCentimes: cheque.baseDzdAmountCentimes,
+        method: 'cheque',
+        bankAccountId: targetBank,
+        chequeId: cheque.id,
+        reference: `CHQ ${cheque.chequeNumber}`,
+        notes: params.notes?.trim() || cheque.notes,
+        isAdvance,
+        status: 'valide',
+        createdAt: now,
+        updatedAt: now,
+      };
+      const alloc: PaymentAllocation = {
+        id: createId('alloc'),
+        paymentId: payId,
+        invoiceType: 'client',
+        invoiceId: invoice.id,
+        amountCentimes: allocAmt,
+        createdAt: now,
+      };
+      const ledger: LedgerEntry = {
+        id: createId('led'),
+        date: params.date,
+        direction: 'entree',
+        sourceType: 'cheque_recu_encaisse',
+        sourceId: cheque.id,
+        bankAccountId: targetBank,
+        contactId: invoice.clientId,
+        label: `Chèque reçu encaissé ${cheque.chequeNumber} — ${contactLabel}`,
+        amountCentimes: cheque.amountCentimes,
+        currency: cheque.currency,
+        exchangeRate: cheque.exchangeRate,
+        baseDzdAmountCentimes: cheque.baseDzdAmountCentimes,
+        status: 'valide',
+        createdAt: now,
+      };
+
+      await db.transaction(
+        'rw',
+        [db.incomingCheques, db.payments, db.paymentAllocations, db.ledgerEntries],
+        async () => {
+          await db.payments.put(payment);
+          await db.paymentAllocations.put(alloc);
+          await db.ledgerEntries.put(ledger);
+          await db.incomingCheques.update(cheque.id, {
+            status: 'encaisse',
+            clearingDate: params.date,
+            targetBankAccountId: targetBank,
+            linkedPaymentId: payId,
+            allocatedInvoiceIds: Array.from(new Set([...cheque.allocatedInvoiceIds, invoice.id])),
+            allocatedAmounts: {
+              ...(cheque.allocatedAmounts || {}),
+              [invoice.id]: allocAmt,
+            },
+            isAdvance,
+            updatedAt: now,
+          });
+        }
+      );
+      await refreshInvoiceStoredStatus('client', invoice.id);
+      await recordAudit({
+        action: 'ENCAISSEMENT',
+        entityType: 'cheque_recu',
+        entityId: cheque.id,
+        summary: `Encaissement chèque ${cheque.chequeNumber} sur facture ${invoice.invoiceNumber}`,
+      });
+      return { paymentId: payId, chequeId: cheque.id };
+    }
+
+    // Création d'un nouveau chèque reçu lié à cette facture + paiement immédiat
+    if (!params.chequeNumber?.trim()) {
+      throw new Error('Veuillez saisir le numéro du chèque.');
+    }
+    const chequeId = createId('ichq');
+    const payId = createId('pay');
+    const baseDzd = convertToBaseDzd(params.amountCentimes, invoice.exchangeRate);
+    const incoming: IncomingCheque = {
+      id: chequeId,
+      clientId: invoice.clientId,
+      issuerBank: (params.issuerBank || '').trim() || 'Banque émettrice',
+      chequeNumber: params.chequeNumber.trim(),
+      chequeDate: params.chequeDate || params.date,
+      entryDate: params.date,
+      clearingDate: params.date,
+      amountCentimes: params.amountCentimes,
+      currency: invoice.currency,
+      exchangeRate: invoice.exchangeRate,
+      baseDzdAmountCentimes: baseDzd,
+      targetBankAccountId: params.bankAccountId,
+      status: 'encaisse',
+      isAdvance: false,
+      linkedPaymentId: payId,
+      allocatedInvoiceIds: [invoice.id],
+      allocatedAmounts: { [invoice.id]: params.amountCentimes },
+      notes: (params.notes || '').trim(),
+      createdAt: now,
+      updatedAt: now,
+    };
+    const payment: Payment = {
+      id: payId,
+      direction: 'entrant',
+      contactId: invoice.clientId,
+      date: params.date,
+      amountCentimes: params.amountCentimes,
+      currency: invoice.currency,
+      exchangeRate: invoice.exchangeRate,
+      baseDzdAmountCentimes: baseDzd,
+      method: 'cheque',
+      bankAccountId: params.bankAccountId,
+      chequeId,
+      reference: `CHQ ${incoming.chequeNumber}`,
+      notes: (params.notes || '').trim(),
+      isAdvance: false,
+      status: 'valide',
+      createdAt: now,
+      updatedAt: now,
+    };
+    const alloc: PaymentAllocation = {
+      id: createId('alloc'),
+      paymentId: payId,
+      invoiceType: 'client',
+      invoiceId: invoice.id,
+      amountCentimes: params.amountCentimes,
+      createdAt: now,
+    };
+    const ledger: LedgerEntry = {
+      id: createId('led'),
+      date: params.date,
+      direction: 'entree',
+      sourceType: 'cheque_recu_encaisse',
+      sourceId: chequeId,
+      bankAccountId: params.bankAccountId,
+      contactId: invoice.clientId,
+      label: `Chèque reçu ${incoming.chequeNumber} — ${contactLabel} (Facture ${invoice.invoiceNumber})`,
+      amountCentimes: params.amountCentimes,
+      currency: invoice.currency,
+      exchangeRate: invoice.exchangeRate,
+      baseDzdAmountCentimes: baseDzd,
+      status: 'valide',
+      createdAt: now,
+    };
+
+    await db.transaction(
+      'rw',
+      [db.incomingCheques, db.payments, db.paymentAllocations, db.ledgerEntries],
+      async () => {
+        await db.incomingCheques.put(incoming);
+        await db.payments.put(payment);
+        await db.paymentAllocations.put(alloc);
+        await db.ledgerEntries.put(ledger);
+      }
+    );
+    await refreshInvoiceStoredStatus('client', invoice.id);
+    await recordAudit({
+      action: 'CREATION',
+      entityType: 'cheque_recu',
+      entityId: chequeId,
+      summary: `Paiement facture ${invoice.invoiceNumber} par chèque N° ${incoming.chequeNumber}`,
+      after: { incoming, payment },
+    });
+    return { paymentId: payId, chequeId };
+  }
+
+  // Modes directs : Espèces, Virement, Versement, Carte
+  const res = await recordPaymentOrCheque({
+    direction: 'entrant',
+    contactId: invoice.clientId,
+    date: params.date,
+    amountCentimes: params.amountCentimes,
+    currency: invoice.currency,
+    exchangeRate: invoice.exchangeRate,
+    method: params.method,
+    bankAccountId: params.method === 'especes' ? null : params.bankAccountId,
+    reference: params.reference?.trim() || '',
+    notes: params.notes?.trim() || `Règlement facture ${invoice.invoiceNumber}`,
+    allocations: [{ invoiceId: invoice.id, amountCentimes: params.amountCentimes }],
+  });
+  return { paymentId: res.id };
+}
+
+/**
+ * Repasse une facture à "Non payée" en annulant/mettant en corbeille les règlements liés.
+ * Les paiements dédiés uniquement à cette facture sont placés en corbeille (restaurables).
+ * Si un paiement couvrait plusieurs factures, seule l'affectation à cette facture est retirée.
+ */
+export async function revertInvoiceToUnpaid(params: {
+  invoiceType: 'client' | 'fournisseur';
+  invoiceId: string;
+  reason?: string;
+}): Promise<{ cancelledPaymentsCount: number; detachedAllocationsCount: number }> {
+  const now = new Date().toISOString();
+  const reason = params.reason?.trim() || 'Facture repassée en « Non payée »';
+  const allocs = await db.paymentAllocations.where('invoiceId').equals(params.invoiceId).toArray();
+
+  let cancelledPaymentsCount = 0;
+  let detachedAllocationsCount = 0;
+
+  await db.transaction(
+    'rw',
+    [db.payments, db.paymentAllocations, db.ledgerEntries, db.customerInvoices, db.supplierInvoices],
+    async () => {
+      const processedPaymentIds = new Set<string>();
+      for (const alloc of allocs) {
+        if (processedPaymentIds.has(alloc.paymentId)) continue;
+        processedPaymentIds.add(alloc.paymentId);
+
+        const pay = await db.payments.get(alloc.paymentId);
+        if (!pay || pay.status !== 'valide' || pay.deletedAt) continue;
+
+        const allPayAllocs = await db.paymentAllocations
+          .where('paymentId')
+          .equals(pay.id)
+          .toArray();
+        const otherInvoiceAllocs = allPayAllocs.filter((a) => a.invoiceId !== params.invoiceId);
+
+        if (otherInvoiceAllocs.length === 0) {
+          // Paiement dédié uniquement à cette facture -> annulation + corbeille (restorable)
+          await db.payments.update(pay.id, {
+            status: 'annule',
+            cancelReason: reason,
+            cancelledAt: now,
+            deletedAt: now,
+            updatedAt: now,
+          });
+          const leds = await db.ledgerEntries.where('sourceId').equals(pay.id).toArray();
+          for (const l of leds) {
+            await db.ledgerEntries.update(l.id, { status: 'annule' });
+          }
+          if (pay.chequeId) {
+            const chqLeds = await db.ledgerEntries.where('sourceId').equals(pay.chequeId).toArray();
+            for (const l of chqLeds) {
+              await db.ledgerEntries.update(l.id, { status: 'annule' });
+            }
+          }
+          cancelledPaymentsCount += 1;
+        } else {
+          // Paiement partagé sur plusieurs factures -> retirer uniquement l'affectation à cette facture
+          for (const a of allPayAllocs.filter((x) => x.invoiceId === params.invoiceId)) {
+            await db.paymentAllocations.delete(a.id);
+            detachedAllocationsCount += 1;
+          }
+          await db.payments.update(pay.id, { isAdvance: true, updatedAt: now });
+        }
+      }
+    }
+  );
+
+  await refreshInvoiceStoredStatus(params.invoiceType, params.invoiceId);
+
+  await recordAudit({
+    action: 'ANNULATION',
+    entityType: params.invoiceType === 'client' ? 'facture_client' : 'facture_fournisseur',
+    entityId: params.invoiceId,
+    summary: `Remise au statut « Non payée » (${cancelledPaymentsCount} paiement(s) mis en corbeille)`,
+    reason,
+  });
+
+  return { cancelledPaymentsCount, detachedAllocationsCount };
 }
 
 export async function saveExpense(params: {

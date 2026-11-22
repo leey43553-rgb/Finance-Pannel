@@ -185,48 +185,144 @@ export async function saveCampaign(params: {
   existingId?: string;
   name: string;
   clientId: string;
+  companyProfileId?: string;
   startDate: string;
   endDate: string;
   status?: CampaignStatus;
   notes?: string;
+  propagateToLinkedDocs?: boolean;
+  propagateClient?: boolean;
 }): Promise<Campaign> {
   if (!params.name.trim()) throw new Error('Le nom de la campagne est obligatoire.');
   if (!params.clientId) throw new Error('Veuillez sélectionner un client.');
-  if (!params.startDate || !params.endDate) {
-    throw new Error('Les dates de début et de fin sont obligatoires.');
-  }
-  const dur = computeCampaignDuration(params.startDate, params.endDate);
-  if (!dur.valid) {
-    throw new Error(dur.label);
+  if (params.startDate && params.endDate) {
+    const dur = computeCampaignDuration(params.startDate, params.endDate);
+    if (!dur.valid) {
+      throw new Error(dur.label);
+    }
   }
 
   const now = new Date().toISOString();
   const existing = params.existingId ? await db.campaigns.get(params.existingId) : undefined;
-  const status = params.status || suggestCampaignStatus(params.startDate, params.endDate);
+  const status =
+    params.status || existing?.status || suggestCampaignStatus(params.startDate, params.endDate);
 
   const record: Campaign = {
     id: existing?.id || createId('cmp'),
     name: params.name.trim(),
     clientId: params.clientId,
-    startDate: params.startDate,
-    endDate: params.endDate,
+    companyProfileId:
+      'companyProfileId' in params
+        ? params.companyProfileId || undefined
+        : existing?.companyProfileId,
+    startDate: params.startDate || '',
+    endDate: params.endDate || '',
     status,
     notes: (params.notes || '').trim(),
     createdAt: existing?.createdAt || now,
     updatedAt: now,
   };
 
-  await db.campaigns.put(record);
+  await db.transaction(
+    'rw',
+    [db.campaigns, db.purchaseOrders, db.proformas, db.customerInvoices],
+    async () => {
+      await db.campaigns.put(record);
+
+      if (params.propagateToLinkedDocs && existing) {
+        const [pos, pfs, invs] = await Promise.all([
+          db.purchaseOrders.where('campaignId').equals(record.id).toArray(),
+          db.proformas.where('campaignId').equals(record.id).toArray(),
+          db.customerInvoices.where('campaignId').equals(record.id).toArray(),
+        ]);
+
+        for (const po of pos) {
+          if (po.deletedAt) continue;
+          await db.purchaseOrders.update(po.id, {
+            campaignRef: record.name,
+            campaignStartDate: record.startDate || undefined,
+            campaignEndDate: record.endDate || undefined,
+            ...(params.propagateClient && po.direction === 'bc_recu'
+              ? { contactId: record.clientId }
+              : {}),
+            updatedAt: now,
+          });
+        }
+        for (const pf of pfs) {
+          if (pf.deletedAt) continue;
+          await db.proformas.update(pf.id, {
+            campaignRef: record.name,
+            campaignStartDate: record.startDate || undefined,
+            campaignEndDate: record.endDate || undefined,
+            ...(params.propagateClient ? { clientId: record.clientId } : {}),
+            updatedAt: now,
+          });
+        }
+        for (const inv of invs) {
+          if (inv.deletedAt) continue;
+          await db.customerInvoices.update(inv.id, {
+            campaignRef: record.name,
+            campaignStartDate: record.startDate || undefined,
+            campaignEndDate: record.endDate || undefined,
+            ...(params.propagateClient ? { clientId: record.clientId } : {}),
+            updatedAt: now,
+          });
+        }
+      }
+    }
+  );
+
   await recordAudit({
     action: existing ? 'MODIFICATION' : 'CREATION',
     entityType: 'campagne',
     entityId: record.id,
-    summary: `${existing ? 'Modification' : 'Création'} campagne « ${record.name} »`,
+    summary: `${existing ? 'Modification' : 'Création'} campagne « ${record.name} »${
+      params.propagateToLinkedDocs ? ' (propagée aux documents liés)' : ''
+    }`,
     before: existing,
     after: record,
   });
 
   return record;
+}
+
+export async function linkOrUnlinkDocumentToCampaign(params: {
+  campaignId: string;
+  docType: 'invoice' | 'proforma' | 'bc';
+  docId: string;
+  link: boolean;
+}): Promise<void> {
+  const campaign = await db.campaigns.get(params.campaignId);
+  if (!campaign) throw new Error('Campagne introuvable.');
+  const now = new Date().toISOString();
+
+  const patch = params.link
+    ? {
+        campaignId: campaign.id,
+        campaignRef: campaign.name,
+        campaignStartDate: campaign.startDate || undefined,
+        campaignEndDate: campaign.endDate || undefined,
+        updatedAt: now,
+      }
+    : {
+        campaignId: undefined,
+        updatedAt: now,
+      };
+
+  if (params.docType === 'invoice') {
+    await db.customerInvoices.update(params.docId, patch);
+  } else if (params.docType === 'proforma') {
+    await db.proformas.update(params.docId, patch);
+  } else {
+    await db.purchaseOrders.update(params.docId, patch);
+  }
+
+  await recordAudit({
+    action: 'MODIFICATION',
+    entityType: 'campagne',
+    entityId: campaign.id,
+    summary: `${params.link ? 'Rattachement' : 'Déliaison'} ${params.docType} sur campagne « ${campaign.name} »`,
+  });
 }
 
 // ============================================================================

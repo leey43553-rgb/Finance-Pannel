@@ -27,10 +27,23 @@ import type {
   OutgoingCheque,
   Payment,
   PaymentAllocation,
+  PrintSettings,
   Proforma,
   PurchaseOrder,
   SupplierInvoice,
 } from './types';
+
+export const DEFAULT_PRINT_SETTINGS: PrintSettings = {
+  defaultPrinterName: '',
+  paperSize: 'A4',
+  orientation: 'portrait',
+  margins: 'none',
+  color: true,
+  copies: 1,
+  fitToPage: true,
+  previewBeforePrint: true,
+  silentPrint: false,
+};
 
 export const DEFAULT_EXPENSE_CATEGORIES: Omit<ExpenseCategory, 'createdAt'>[] = [
   { id: 'cat-loyer', name: 'Loyer & charges', color: '#1e40af', isDefault: true },
@@ -73,6 +86,7 @@ export function createDefaultSettings(): CompanySettings {
     developerBrand: DEVELOPER_BRAND,
     appVersion: APP_VERSION,
     isDemoDataLoaded: false,
+    printSettings: { ...DEFAULT_PRINT_SETTINGS },
     updatedAt: now,
   };
 }
@@ -357,6 +371,15 @@ export async function ensureDatabaseInitialized(): Promise<CompanySettings> {
     settingsRecord = {
       ...settingsRecord,
       logoDataUrl: DEFAULT_VISTA_LOGO_DATA_URL,
+      updatedAt: now,
+    };
+    await db.settings.put(settingsRecord);
+  }
+
+  if (!settingsRecord.printSettings) {
+    settingsRecord = {
+      ...settingsRecord,
+      printSettings: { ...DEFAULT_PRINT_SETTINGS },
       updatedAt: now,
     };
     await db.settings.put(settingsRecord);

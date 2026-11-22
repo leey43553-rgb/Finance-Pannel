@@ -149,12 +149,23 @@ export function computeContactAccountSummary(params: {
   }>;
   payments: Payment[];
   allocations: PaymentAllocation[];
+  incomingCheques?: Array<{
+    id: string;
+    clientId: string;
+    status: string;
+    isAdvance?: boolean;
+    allocatedInvoiceIds: string[];
+    linkedPaymentId?: string;
+    baseDzdAmountCentimes: number;
+    deletedAt?: string;
+  }>;
 }): {
   totalInvoicedBaseDzd: number;
   totalAllocatedToInvoicesBaseDzd: number;
   totalUnpaidBaseDzd: number;
   totalPaymentsReceivedBaseDzd: number;
   availableAdvanceBaseDzd: number;
+  pendingAdvanceChequesBaseDzd: number;
 } {
   const validPayments = params.payments.filter(
     (p) =>
@@ -162,7 +173,6 @@ export function computeContactAccountSummary(params: {
       p.contactId === params.contactId &&
       p.direction === (params.direction === 'client' ? 'entrant' : 'sortant')
   );
-  const validPaymentMap = new Map(validPayments.map((p) => [p.id, p]));
   const validPaymentIds = new Set(validPayments.map((p) => p.id));
 
   let totalInvoicedBaseDzd = 0;
@@ -197,6 +207,23 @@ export function computeContactAccountSummary(params: {
     availableAdvanceBaseDzd = addMoney(availableAdvanceBaseDzd, unallocatedDzd);
   }
 
+  let pendingAdvanceChequesBaseDzd = 0;
+  if (params.direction === 'client' && params.incomingCheques) {
+    for (const ch of params.incomingCheques) {
+      if (ch.deletedAt) continue;
+      if (ch.clientId !== params.contactId) continue;
+      if (ch.status === 'rejete' || ch.status === 'annule' || ch.status === 'encaisse') continue;
+      const isAdvanceCheque = ch.isAdvance === true || ch.allocatedInvoiceIds.length === 0;
+      if (isAdvanceCheque) {
+        pendingAdvanceChequesBaseDzd = addMoney(
+          pendingAdvanceChequesBaseDzd,
+          ch.baseDzdAmountCentimes
+        );
+      }
+    }
+    availableAdvanceBaseDzd = addMoney(availableAdvanceBaseDzd, pendingAdvanceChequesBaseDzd);
+  }
+
   const totalUnpaidBaseDzd = Math.max(0, subtractMoney(totalInvoicedBaseDzd, totalAllocatedToInvoicesBaseDzd));
 
   return {
@@ -205,6 +232,7 @@ export function computeContactAccountSummary(params: {
     totalUnpaidBaseDzd,
     totalPaymentsReceivedBaseDzd,
     availableAdvanceBaseDzd,
+    pendingAdvanceChequesBaseDzd,
   };
 }
 

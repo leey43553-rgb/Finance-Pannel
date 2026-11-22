@@ -10,11 +10,17 @@ import type {
 } from '../db/types';
 import {
   generateNextInvoiceNumber,
+  revertInvoiceToUnpaid,
   saveCustomerInvoice,
   saveSupplierInvoice,
 } from '../services/financeActions';
 import { computeCampaignDuration } from '../utils/documentHelpers';
-import { computeInvoiceDocumentTotals } from '../utils/finance';
+import {
+  computeInvoiceDocumentTotals,
+  computeInvoicePaidCentimes,
+  computeInvoiceRemainingCentimes,
+  computeInvoiceStatus,
+} from '../utils/finance';
 import {
   createDefaultEditableLine,
   editableToInvoiceLineInput,
@@ -34,6 +40,7 @@ import { CampaignSelector } from './CampaignSelector';
 import { BcRecuSelector } from './BcRecuSelector';
 import { AttachmentPreviewModal } from './AttachmentPreviewModal';
 import { SmartLineEditor } from './SmartLineEditor';
+import { InvoiceStatusPaymentModal } from './InvoiceStatusPaymentModal';
 
 interface InvoiceFormModalProps {
   open: boolean;
@@ -101,6 +108,37 @@ export const InvoiceFormModal: React.FC<InvoiceFormModalProps> = ({
   const [previewBcAttId, setPreviewBcAttId] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [statusPaymentModal, setStatusPaymentModal] = useState<'payee' | 'partielle' | null>(null);
+  const [confirmUnpayOpen, setConfirmUnpayOpen] = useState(false);
+
+  const payments = useLiveQuery(() => db.payments.filter((p) => !p.deletedAt).toArray(), [], []);
+  const allocations = useLiveQuery(
+    () =>
+      db.paymentAllocations
+        .where('invoiceId')
+        .equals(existingInvoice?.id || '__none__')
+        .toArray(),
+    [existingInvoice?.id],
+    []
+  );
+
+  const existingPaymentStats = useMemo(() => {
+    if (!existingInvoice) return null;
+    const validIds = new Set(payments.filter((p) => p.status === 'valide').map((p) => p.id));
+    const paid = computeInvoicePaidCentimes(existingInvoice.id, allocations, validIds);
+    const remaining = computeInvoiceRemainingCentimes(
+      existingInvoice.totalTtcCentimes,
+      paid,
+      existingInvoice.status
+    );
+    const computedStatus = computeInvoiceStatus({
+      storedStatus: existingInvoice.status,
+      totalTtcCentimes: existingInvoice.totalTtcCentimes,
+      paidCentimes: paid,
+      dueDate: existingInvoice.dueDate,
+    });
+    return { paid, remaining, computedStatus };
+  }, [existingInvoice, payments, allocations]);
 
   const defaultTva = settings?.defaultTvaRate ?? 19;
   const showAdvancedFields = !isSimple || showMoreOptions;
@@ -389,6 +427,85 @@ export const InvoiceFormModal: React.FC<InvoiceFormModalProps> = ({
           {error && (
             <div className="rounded-md border border-red-200 bg-red-50 px-4 py-2.5 text-sm text-red-700">
               {error}
+            </div>
+          )}
+
+          {mode === 'client' && existingInvoice && existingPaymentStats && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-xs">
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="font-semibold text-slate-700">Statut paiement :</span>
+                <span
+                  className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${
+                    existingPaymentStats.computedStatus === 'payee'
+                      ? 'border-emerald-200 bg-emerald-100 text-emerald-800'
+                      : existingPaymentStats.computedStatus === 'partielle'
+                      ? 'border-orange-200 bg-orange-100 text-orange-800'
+                      : existingPaymentStats.computedStatus === 'annulee'
+                      ? 'border-slate-200 bg-slate-100 text-slate-500 line-through'
+                      : 'border-red-200 bg-red-100 text-red-800'
+                  }`}
+                >
+                  {existingPaymentStats.computedStatus === 'payee'
+                    ? 'Payée'
+                    : existingPaymentStats.computedStatus === 'partielle'
+                    ? 'Partiellement payée'
+                    : existingPaymentStats.computedStatus === 'en_retard'
+                    ? 'En retard'
+                    : existingPaymentStats.computedStatus === 'annulee'
+                    ? 'Annulée'
+                    : 'Non payée'}
+                </span>
+                {existingInvoice.status !== 'annulee' && (
+                  <select
+                    value={
+                      existingPaymentStats.computedStatus === 'payee'
+                        ? 'payee'
+                        : existingPaymentStats.computedStatus === 'partielle'
+                        ? 'partielle'
+                        : 'impayee'
+                    }
+                    onChange={(e) => {
+                      const val = e.target.value as 'impayee' | 'partielle' | 'payee';
+                      if (val === 'impayee') {
+                        if (existingPaymentStats.paid > 0) {
+                          setConfirmUnpayOpen(true);
+                        }
+                      } else if (existingPaymentStats.remaining > 0) {
+                        setStatusPaymentModal(val);
+                      }
+                    }}
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-800"
+                  >
+                    <option value="impayee">Non payée</option>
+                    <option value="partielle">Partiellement payée</option>
+                    <option value="payee">Payée</option>
+                  </select>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="text-slate-600 tabular-nums">
+                  Payé :{' '}
+                  <strong className="text-emerald-700">
+                    {formatMoney(existingPaymentStats.paid, existingInvoice.currency)}
+                  </strong>
+                </span>
+                <span className="text-slate-600 tabular-nums">
+                  Reste :{' '}
+                  <strong className="text-red-700">
+                    {formatMoney(existingPaymentStats.remaining, existingInvoice.currency)}
+                  </strong>
+                </span>
+                {existingInvoice.status !== 'annulee' && existingPaymentStats.remaining > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setStatusPaymentModal('partielle')}
+                    className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+                  >
+                    + Ajouter un paiement / avance
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -803,10 +920,69 @@ export const InvoiceFormModal: React.FC<InvoiceFormModalProps> = ({
         <AttachmentPreviewModal
           open={Boolean(previewBcAttId)}
           parentId={previewBcAttId}
+          parentType="bc_recu"
           title={`Pièce jointe BC ${bcNumber}`}
           readOnly
           onClose={() => setPreviewBcAttId(null)}
         />
+      )}
+
+      {mode === 'client' && existingInvoice && statusPaymentModal && existingPaymentStats && (
+        <InvoiceStatusPaymentModal
+          open={Boolean(statusPaymentModal)}
+          invoice={existingInvoice as CustomerInvoice}
+          targetStatus={statusPaymentModal}
+          remainingCentimes={existingPaymentStats.remaining}
+          onClose={() => setStatusPaymentModal(null)}
+        />
+      )}
+
+      {confirmUnpayOpen && existingInvoice && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-6 shadow-xl space-y-4">
+            <h3 className="text-base font-semibold text-slate-900">
+              Remettre la facture {existingInvoice.invoiceNumber} en « Non payée » ?
+            </h3>
+            <p className="text-xs text-slate-600">
+              Les paiements liés à cette facture seront annulés et placés dans la Corbeille (restaurables à tout moment).
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmUnpayOpen(false)}
+                className="rounded-md border border-slate-300 bg-white px-4 py-2 text-xs font-medium text-slate-700"
+              >
+                Fermer
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await revertInvoiceToUnpaid({
+                      invoiceType: mode,
+                      invoiceId: existingInvoice.id,
+                    });
+                    pushToast({
+                      type: 'info',
+                      title: 'Facture remise en Non payée',
+                      message: 'Les paiements associés ont été déplacés vers la Corbeille.',
+                    });
+                    setConfirmUnpayOpen(false);
+                  } catch (err) {
+                    pushToast({
+                      type: 'error',
+                      title: 'Erreur',
+                      message: err instanceof Error ? err.message : 'Erreur',
+                    });
+                  }
+                }}
+                className="rounded-md bg-red-600 px-4 py-2 text-xs font-medium text-white hover:bg-red-700"
+              >
+                Confirmer l’annulation des paiements
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

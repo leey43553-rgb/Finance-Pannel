@@ -310,11 +310,125 @@ ipcMain.handle('backup:getDefaultFolder', async () => {
   return { ok: true, directory: resolveBackupDir() };
 });
 
+function normalizePrintRouteHash(printRoute) {
+  if (!printRoute || typeof printRoute !== 'string') return '';
+  const trimmed = printRoute.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('#')) return trimmed;
+  return `#${trimmed.startsWith('/') ? trimmed : `/${trimmed}`}`;
+}
+
+async function createAndLoadHiddenPrintWindow({ printRoute, htmlContent }) {
+  const hiddenWin = new BrowserWindow({
+    show: false,
+    width: 900,
+    height: 1200,
+    backgroundColor: '#ffffff',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  hiddenWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+  const waitForDidFinishLoad = () =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Délai de chargement impression dépassé.')), 10000);
+      hiddenWin.webContents.once('did-finish-load', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      hiddenWin.webContents.once('did-fail-load', (_e, code, desc) => {
+        clearTimeout(timer);
+        reject(new Error(desc || `Échec de chargement (${code}).`));
+      });
+    });
+
+  if (htmlContent && typeof htmlContent === 'string') {
+    const loadPromise = waitForDidFinishLoad();
+    await hiddenWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(htmlContent)}`);
+    await loadPromise;
+    await hiddenWin.webContents
+      .executeJavaScript(
+        `Promise.all([
+          document.fonts ? document.fonts.ready : Promise.resolve(),
+          ...Array.from(document.images).map(img => img.complete ? Promise.resolve() : new Promise(r => { img.onload = r; img.onerror = r; setTimeout(r, 1500); }))
+        ]).then(() => true)`
+      )
+      .catch(() => true);
+    await new Promise((r) => setTimeout(r, 120));
+    return hiddenWin;
+  }
+
+  const hash = normalizePrintRouteHash(printRoute);
+  const loadPromise = waitForDidFinishLoad();
+  if (isDev) {
+    const base = String(process.env.VITE_DEV_SERVER_URL || 'http://localhost:3000').replace(/#.*$/, '');
+    await hiddenWin.loadURL(`${base}${hash}`);
+  } else {
+    const distFile = path.join(__dirname, '..', 'dist', 'index.html');
+    await hiddenWin.loadFile(distFile, { hash: hash.replace(/^#/, '') });
+  }
+  await loadPromise;
+
+  // Attendre que la route d'impression Dexie signale [data-print-ready="true"]
+  if (hash) {
+    const started = Date.now();
+    while (Date.now() - started < 5500) {
+      const ready = await hiddenWin.webContents
+        .executeJavaScript(
+          `(() => {
+            const el = document.querySelector('[data-print-ready="true"]');
+            if (!el) return false;
+            const imgs = Array.from(document.images);
+            return imgs.every(img => img.complete);
+          })()`
+        )
+        .catch(() => false);
+      if (ready) break;
+      await new Promise((r) => setTimeout(r, 70));
+    }
+  }
+
+  await hiddenWin.webContents
+    .executeJavaScript(`document.fonts ? document.fonts.ready.then(() => true) : true`)
+    .catch(() => true);
+  await new Promise((r) => setTimeout(r, 120));
+  return hiddenWin;
+}
+
+ipcMain.handle('printers:list', async () => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return { ok: false, printers: [], error: 'Fenêtre introuvable.' };
+  }
+  try {
+    const list = await mainWindow.webContents.getPrintersAsync();
+    const printers = (list || []).map((p) => ({
+      name: p.name,
+      displayName: p.displayName || p.name,
+      description: p.description || '',
+      isDefault: Boolean(p.isDefault),
+      status: p.status,
+    }));
+    return { ok: true, printers };
+  } catch (err) {
+    return {
+      ok: false,
+      printers: [],
+      error: err instanceof Error ? err.message : 'Impossible de lister les imprimantes.',
+    };
+  }
+});
+
 ipcMain.handle('pdf:printToPDF', async (_event, options) => {
   if (!mainWindow) {
     return { ok: false, error: 'Fenêtre introuvable.' };
   }
 
+  let hiddenWin = null;
   try {
     const defaultName = (options && options.defaultFileName) || 'document-gestion-financiere.pdf';
     const companyName =
@@ -322,6 +436,8 @@ ipcMain.handle('pdf:printToPDF', async (_event, options) => {
         ? options.companyName.trim()
         : 'Gestion Financière';
     const isRawA4 = Boolean(options && options.rawLayout);
+    const pageSize = (options && options.paperSize) || 'A4';
+    const landscape = Boolean(options && options.landscape);
 
     const saveRes = await dialog.showSaveDialog(mainWindow, {
       title: 'Enregistrer le document en PDF',
@@ -333,20 +449,29 @@ ipcMain.handle('pdf:printToPDF', async (_event, options) => {
       return { ok: false, canceled: true };
     }
 
+    let targetWebContents = mainWindow.webContents;
+    if ((options && options.printRoute) || (options && options.htmlContent)) {
+      hiddenWin = await createAndLoadHiddenPrintWindow({
+        printRoute: options.printRoute,
+        htmlContent: options.htmlContent,
+      });
+      targetWebContents = hiddenWin.webContents;
+    }
+
     const safeCompany = companyName.replace(/[<>&"]/g, '');
-    const pdfBuffer = await mainWindow.webContents.printToPDF(
-      isRawA4
+    const pdfBuffer = await targetWebContents.printToPDF(
+      isRawA4 || Boolean(options && options.htmlContent)
         ? {
             printBackground: true,
-            pageSize: 'A4',
-            landscape: Boolean(options && options.landscape),
+            pageSize,
+            landscape,
             displayHeaderFooter: false,
             margins: { marginType: 'none' },
           }
         : {
             printBackground: true,
-            pageSize: 'A4',
-            landscape: Boolean(options && options.landscape),
+            pageSize,
+            landscape,
             displayHeaderFooter: true,
             headerTemplate: '<div></div>',
             footerTemplate: `<div style="width:100%;font-family:Arial,sans-serif;font-size:8px;color:#64748b;padding:0 12mm;display:flex;justify-content:space-between;align-items:center;"><span>${safeCompany} — Gestion Financière</span><span>Page <span class="pageNumber"></span> / <span class="totalPages"></span></span></div>`,
@@ -358,6 +483,10 @@ ipcMain.handle('pdf:printToPDF', async (_event, options) => {
     return { ok: true, filePath: saveRes.filePath };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Erreur lors de la génération PDF.' };
+  } finally {
+    if (hiddenWin && !hiddenWin.isDestroyed()) {
+      hiddenWin.destroy();
+    }
   }
 });
 
@@ -373,15 +502,54 @@ ipcMain.handle('pdf:openFolder', async (_event, filePath) => {
   }
 });
 
-ipcMain.handle('pdf:printDirect', async () => {
+ipcMain.handle('pdf:printDirect', async (_event, options = {}) => {
   if (!mainWindow) return { ok: false, error: 'Fenêtre introuvable.' };
-  return new Promise((resolve) => {
-    mainWindow.webContents.print({ printBackground: true }, (success, failureReason) => {
-      if (!success) {
-        resolve({ ok: false, error: failureReason || 'Impression annulée.' });
-      } else {
-        resolve({ ok: true });
-      }
+
+  let hiddenWin = null;
+  try {
+    let targetWebContents = mainWindow.webContents;
+    if ((options && options.printRoute) || (options && options.htmlContent)) {
+      hiddenWin = await createAndLoadHiddenPrintWindow({
+        printRoute: options.printRoute,
+        htmlContent: options.htmlContent,
+      });
+      targetWebContents = hiddenWin.webContents;
+    }
+
+    const ps = (options && options.printSettings) || {};
+    const marginType =
+      ps.margins === 'none' ? 'none' : ps.margins === 'minimum' ? 'minimum' : 'default';
+    const printOpts = {
+      silent: Boolean(ps.silentPrint),
+      printBackground: true,
+      deviceName:
+        typeof ps.defaultPrinterName === 'string' && ps.defaultPrinterName.trim()
+          ? ps.defaultPrinterName.trim()
+          : undefined,
+      color: ps.color !== undefined ? Boolean(ps.color) : true,
+      copies: Math.max(1, Number(ps.copies) || 1),
+      landscape: ps.orientation === 'landscape',
+      pageSize: ps.paperSize || 'A4',
+      margins: { marginType },
+    };
+
+    return await new Promise((resolve) => {
+      targetWebContents.print(printOpts, (success, failureReason) => {
+        if (!success) {
+          resolve({ ok: false, error: failureReason || 'Impression annulée.' });
+        } else {
+          resolve({ ok: true });
+        }
+      });
     });
-  });
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Erreur lors de l’impression.',
+    };
+  } finally {
+    if (hiddenWin && !hiddenWin.isDestroyed()) {
+      hiddenWin.destroy();
+    }
+  }
 });

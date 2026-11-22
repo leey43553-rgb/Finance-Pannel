@@ -190,6 +190,7 @@ export const ContactsPage: React.FC<ContactsPageProps> = ({ mode }) => {
           invoices: relevantInvoices,
           payments,
           allocations,
+          incomingCheques: mode === 'client' ? incomingCheques : undefined,
         });
         return { contact, summary };
       });
@@ -212,7 +213,18 @@ export const ContactsPage: React.FC<ContactsPageProps> = ({ mode }) => {
     });
 
     return list;
-  }, [contacts, mode, filterMode, search, relevantInvoices, payments, allocations, sortField, sortAsc]);
+  }, [
+    contacts,
+    mode,
+    filterMode,
+    search,
+    relevantInvoices,
+    payments,
+    allocations,
+    incomingCheques,
+    sortField,
+    sortAsc,
+  ]);
 
   const selectedRow = useMemo(
     () => rows.find((r) => r.contact.id === selectedContactId) || null,
@@ -841,6 +853,16 @@ export const ContactsPage: React.FC<ContactsPageProps> = ({ mode }) => {
                     currencies
                   )}
                 </div>
+                {selectedRow.summary.pendingAdvanceChequesBaseDzd > 0 && (
+                  <div className="mt-0.5 text-[10px] text-slate-500 tabular-nums">
+                    dont chèques en attente :{' '}
+                    {formatMoney(
+                      selectedRow.summary.pendingAdvanceChequesBaseDzd,
+                      defaultCurrency,
+                      currencies
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1386,6 +1408,16 @@ export const ContactsPage: React.FC<ContactsPageProps> = ({ mode }) => {
                       )}
                     </strong>
                   </div>
+                  {selectedRow.summary.pendingAdvanceChequesBaseDzd > 0 && (
+                    <div className="text-[11px] text-slate-500">
+                      dont chèques d’avance en attente :{' '}
+                      {formatMoney(
+                        selectedRow.summary.pendingAdvanceChequesBaseDzd,
+                        defaultCurrency,
+                        currencies
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 

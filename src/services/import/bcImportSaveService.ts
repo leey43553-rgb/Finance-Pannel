@@ -515,17 +515,15 @@ export async function ensureBcCampaignSaved(params: {
   const match = clientCampaigns.find((c) => normCompare(c.name) === normCompare(name));
   if (match) return match;
 
-  const sDate = params.startDate || params.fallbackDate || new Date().toISOString().slice(0, 10);
-  const eDate =
-    params.endDate && params.endDate >= sDate
-      ? params.endDate
-      : sDate;
+  const sDate = params.startDate || '';
+  const eDate = params.endDate && (!sDate || params.endDate >= sDate) ? params.endDate : '';
 
   return saveCampaign({
     name,
     clientId: params.clientId,
     startDate: sDate,
     endDate: eDate,
+    status: 'en_cours',
     notes: 'Créée automatiquement lors de l’import BC',
   });
 }

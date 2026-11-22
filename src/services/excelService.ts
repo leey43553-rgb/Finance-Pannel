@@ -1518,16 +1518,16 @@ export async function executeValidatedImport(params: {
               (c) => c.clientId === client.id && normalizeHeaderText(c.name) === normCamp
             );
             if (!matchedCamp && createMissingCampaigns) {
-              const sDate = campaignStartDate || issueDate;
+              const sDate = campaignStartDate || '';
               const eDate =
-                campaignEndDate && campaignEndDate >= sDate ? campaignEndDate : sDate;
+                campaignEndDate && (!sDate || campaignEndDate >= sDate) ? campaignEndDate : '';
               const createdCamp: Campaign = {
                 id: createId('cmp'),
                 name: campaignRef,
                 clientId: client.id,
                 startDate: sDate,
                 endDate: eDate,
-                status: suggestCampaignStatus(sDate, eDate),
+                status: sDate && eDate ? suggestCampaignStatus(sDate, eDate) : 'en_cours',
                 notes: `Créée lors de l’import Excel (${invoiceNumber})`,
                 createdAt: now,
                 updatedAt: now,
@@ -2526,9 +2526,9 @@ export async function executeInvoiceModelImport(params: {
               id: createId('cmp'),
               name: campName,
               clientId: client.id,
-              startDate: it.date,
-              endDate: it.date,
-              status: suggestCampaignStatus(it.date, it.date),
+              startDate: '',
+              endDate: '',
+              status: 'en_cours',
               notes: `Campagne créée lors de l’import de la facture ${it.number}`,
               createdAt: now,
               updatedAt: now,

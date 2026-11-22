@@ -3,7 +3,11 @@ import { useNavigate } from 'react-router-dom';
 import { Download, ExternalLink, FileSpreadsheet, Loader2, Printer, X, ZoomIn } from 'lucide-react';
 import type { CompanyProfile, CompanySettings } from '../db/types';
 import { useAppStore } from '../store/useAppStore';
-import { printCurrentViewAsPdf, triggerBrowserPrint } from '../utils/print';
+import {
+  captureElementAsStandaloneHtml,
+  printCurrentViewAsPdf,
+  printWithSettings,
+} from '../utils/print';
 
 interface PrintDocumentModalProps {
   open: boolean;
@@ -43,6 +47,9 @@ export const PrintDocumentModal: React.FC<PrintDocumentModalProps> = ({
   const isElectron = Boolean(window.electronAPI?.isElectron);
   const companyName = companyProfile?.name || settings?.companyName || 'Entreprise';
   const accentColor = companyProfile?.accentColor || '#0F1E36';
+  const printSettings = settings?.printSettings;
+  const isLandscape = printSettings?.orientation === 'landscape';
+  const paperSize = printSettings?.paperSize || 'A4';
 
   const handleExportPdf = async () => {
     setIsGeneratingPdf(true);
@@ -51,9 +58,17 @@ export const PrintDocumentModal: React.FC<PrintDocumentModalProps> = ({
         throw new Error('Élément A4 du document introuvable.');
       }
 
+      const htmlContent = !fallbackPrintRoute
+        ? captureElementAsStandaloneHtml(sheetRef.current, printSettings)
+        : undefined;
+
       const res = await printCurrentViewAsPdf(fileName, {
         companyName,
         rawLayout,
+        landscape: isLandscape,
+        paperSize,
+        printRoute: fallbackPrintRoute,
+        htmlContent,
         element: sheetRef.current,
       });
 
@@ -101,7 +116,14 @@ export const PrintDocumentModal: React.FC<PrintDocumentModalProps> = ({
   const handlePrint = async () => {
     try {
       if (isElectron && window.electronAPI?.printDirect) {
-        const res = await window.electronAPI.printDirect();
+        const htmlContent = !fallbackPrintRoute
+          ? captureElementAsStandaloneHtml(sheetRef.current, printSettings)
+          : undefined;
+        const res = await printWithSettings({
+          printRoute: fallbackPrintRoute,
+          htmlContent,
+          printSettings,
+        });
         if (!res.ok) {
           pushToast({
             type: 'error',
@@ -118,13 +140,17 @@ export const PrintDocumentModal: React.FC<PrintDocumentModalProps> = ({
         return;
       }
 
-      const printRes = triggerBrowserPrint();
+      const htmlContent = captureElementAsStandaloneHtml(sheetRef.current, printSettings);
+      const printRes = await printWithSettings({
+        htmlContent,
+        printSettings,
+      });
       if (!printRes.ok) {
         pushToast({
           type: 'warning',
           title: 'Impression bloquée',
           message:
-            printRes.error || "Ouvrez l'application dans un onglet séparé pour imprimer",
+            printRes.error || "Ouvrez l'application dans un onglet séparé pour imprimer (ou cliquez sur Exporter PDF).",
         });
       }
     } catch (err) {

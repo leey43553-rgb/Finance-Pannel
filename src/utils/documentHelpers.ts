@@ -256,8 +256,8 @@ export function getEffectiveCampaignStatus(
   campaign: Pick<Campaign, 'startDate' | 'endDate' | 'status'>,
   referenceDate = new Date().toISOString().slice(0, 10)
 ): CampaignStatus {
-  if (campaign.status === 'annulee') return 'annulee';
-  return campaign.status || suggestCampaignStatus(campaign.startDate, campaign.endDate, referenceDate);
+  if (campaign.status) return campaign.status;
+  return suggestCampaignStatus(campaign.startDate, campaign.endDate, referenceDate);
 }
 
 /**

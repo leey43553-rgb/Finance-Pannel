@@ -8,6 +8,7 @@ import {
   FolderOpen,
   History,
   Plus,
+  Printer,
   RefreshCw,
   RotateCcw,
   Save,
@@ -25,8 +26,15 @@ import {
   GRAVURE_PUB_PROFILE_ID,
   VISTA_DIGITAL_PROFILE_ID,
 } from '../constants/companyPresets';
-import { db, ensureDatabaseInitialized, recordAudit } from '../db/database';
-import type { CompanyProfile, CurrencyConfig } from '../db/types';
+import { db, DEFAULT_PRINT_SETTINGS, ensureDatabaseInitialized, recordAudit } from '../db/database';
+import type {
+  CompanyProfile,
+  CurrencyConfig,
+  PrintMarginMode,
+  PrintOrientation,
+  PrintPaperSize,
+  PrintSettings,
+} from '../db/types';
 import { DEFAULT_OUTDOOR_CATALOG, getEffectiveOutdoorCatalog } from '../utils/guidedLineHelpers';
 import {
   exportFullBackupJson,
@@ -43,12 +51,20 @@ import {
   type TrashItemSummary,
 } from '../services/trashService';
 import { useAppStore } from '../store/useAppStore';
-import type { ElectronBackupFile } from '../types/electron';
+import type { ElectronBackupFile, ElectronPrinterInfo } from '../types/electron';
+import { buildPrintTestHtml, printWithSettings } from '../utils/print';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SafeDeleteDialog } from '../components/SafeDeleteDialog';
 import { useUiMode } from '../hooks/useUiMode';
 
-type SettingsTab = 'entreprise' | 'societes' | 'fiscalite' | 'sauvegardes' | 'corbeille' | 'donnees';
+type SettingsTab =
+  | 'entreprise'
+  | 'societes'
+  | 'fiscalite'
+  | 'impression'
+  | 'sauvegardes'
+  | 'corbeille'
+  | 'donnees';
 
 export const SettingsPage: React.FC = () => {
   const { isSimple } = useUiMode();
@@ -139,6 +155,19 @@ export const SettingsPage: React.FC = () => {
   const [catFaces, setCatFaces] = useState('');
   const [catLocations, setCatLocations] = useState('');
 
+  // Réglages d'impression
+  const [printPrinterName, setPrintPrinterName] = useState(DEFAULT_PRINT_SETTINGS.defaultPrinterName);
+  const [printPaperSize, setPrintPaperSize] = useState<PrintPaperSize>(DEFAULT_PRINT_SETTINGS.paperSize);
+  const [printOrientation, setPrintOrientation] = useState<PrintOrientation>(DEFAULT_PRINT_SETTINGS.orientation);
+  const [printMargins, setPrintMargins] = useState<PrintMarginMode>(DEFAULT_PRINT_SETTINGS.margins);
+  const [printColor, setPrintColor] = useState(DEFAULT_PRINT_SETTINGS.color);
+  const [printCopies, setPrintCopies] = useState(String(DEFAULT_PRINT_SETTINGS.copies));
+  const [printFitToPage, setPrintFitToPage] = useState(DEFAULT_PRINT_SETTINGS.fitToPage);
+  const [printPreviewBefore, setPrintPreviewBefore] = useState(DEFAULT_PRINT_SETTINGS.previewBeforePrint);
+  const [printSilent, setPrintSilent] = useState(DEFAULT_PRINT_SETTINGS.silentPrint);
+  const [systemPrinters, setSystemPrinters] = useState<ElectronPrinterInfo[]>([]);
+  const [loadingPrinters, setLoadingPrinters] = useState(false);
+
   // Confirmations
   const [confirmClearDemo, setConfirmClearDemo] = useState(false);
 
@@ -167,7 +196,30 @@ export const SettingsPage: React.FC = () => {
     setCatPanels(cat.panelTypes.join('\n'));
     setCatFaces(cat.faces.join('\n'));
     setCatLocations(cat.locations.join('\n'));
+    const ps = settings.printSettings ?? DEFAULT_PRINT_SETTINGS;
+    setPrintPrinterName(ps.defaultPrinterName || '');
+    setPrintPaperSize(ps.paperSize || 'A4');
+    setPrintOrientation(ps.orientation || 'portrait');
+    setPrintMargins(ps.margins || 'none');
+    setPrintColor(ps.color !== false);
+    setPrintCopies(String(ps.copies || 1));
+    setPrintFitToPage(ps.fitToPage !== false);
+    setPrintPreviewBefore(ps.previewBeforePrint !== false);
+    setPrintSilent(Boolean(ps.silentPrint));
   }, [settings]);
+
+  const refreshSystemPrinters = async () => {
+    if (!window.electronAPI?.getPrinters) return;
+    setLoadingPrinters(true);
+    try {
+      const res = await window.electronAPI.getPrinters();
+      if (res.ok && Array.isArray(res.printers)) {
+        setSystemPrinters(res.printers);
+      }
+    } finally {
+      setLoadingPrinters(false);
+    }
+  };
 
   const refreshElectronBackups = async (folder?: string) => {
     if (!window.electronAPI?.isElectron) return;
@@ -188,6 +240,9 @@ export const SettingsPage: React.FC = () => {
   useEffect(() => {
     if (activeTab === 'sauvegardes' && window.electronAPI?.isElectron) {
       refreshElectronBackups();
+    }
+    if (activeTab === 'impression' && window.electronAPI?.isElectron) {
+      refreshSystemPrinters();
     }
     if (activeTab === 'corbeille') {
       refreshTrash();
@@ -626,6 +681,7 @@ export const SettingsPage: React.FC = () => {
             { id: 'entreprise' as const, label: 'Entreprise & Logo', icon: Building2 },
             { id: 'societes' as const, label: `Mes sociétés (${companyProfiles.length})`, icon: Star },
             { id: 'fiscalite' as const, label: isSimple ? 'TVA & Numérotation' : 'Devises, TVA & Numérotation', icon: ShieldCheck },
+            { id: 'impression' as const, label: 'Impression', icon: Printer },
             { id: 'sauvegardes' as const, label: 'Sauvegardes & Restauration', icon: Database },
             { id: 'corbeille' as const, label: 'Corbeille', icon: Trash2 },
             { id: 'donnees' as const, label: isSimple ? 'Données démo' : 'Données démo & Journal d’audit', icon: History },
@@ -1652,6 +1708,262 @@ export const SettingsPage: React.FC = () => {
           </div>
         </form>
       )}
+
+      {/* Onglet : Configuration de l'impression */}
+      {activeTab === 'impression' && (() => {
+        const currentFormPrintSettings: PrintSettings = {
+          defaultPrinterName: printPrinterName.trim(),
+          paperSize: printPaperSize,
+          orientation: printOrientation,
+          margins: printMargins,
+          color: printColor,
+          copies: Math.max(1, Math.min(99, parseInt(printCopies, 10) || 1)),
+          fitToPage: printFitToPage,
+          previewBeforePrint: printPreviewBefore,
+          silentPrint: printSilent,
+        };
+        const activeProfile =
+          companyProfiles.find((p) => p.id === settings.activeCompanyProfileId) ||
+          companyProfiles.find((p) => p.isDefault) ||
+          companyProfiles[0];
+
+        const handleSavePrintSettings = async (e: React.FormEvent) => {
+          e.preventDefault();
+          await db.settings.update('company_settings', {
+            printSettings: currentFormPrintSettings,
+            updatedAt: new Date().toISOString(),
+          });
+          await recordAudit({
+            action: 'MODIFICATION',
+            entityType: 'parametres',
+            entityId: 'impression',
+            summary: `Configuration impression (${currentFormPrintSettings.paperSize}, ${currentFormPrintSettings.orientation}, ${currentFormPrintSettings.copies} copie(s))`,
+          });
+          pushToast({
+            type: 'success',
+            title: 'Réglages d’impression enregistrés',
+            message: `${currentFormPrintSettings.paperSize} · ${
+              currentFormPrintSettings.orientation === 'landscape' ? 'Paysage' : 'Portrait'
+            } · ${currentFormPrintSettings.copies} copie(s).`,
+          });
+        };
+
+        const handleTestPrint = async () => {
+          const htmlContent = buildPrintTestHtml(
+            settings,
+            activeProfile,
+            currentFormPrintSettings
+          );
+          const res = await printWithSettings({
+            htmlContent,
+            printSettings: currentFormPrintSettings,
+          });
+          if (!res.ok) {
+            pushToast({
+              type: res.blockedByIframe ? 'warning' : 'error',
+              title: res.blockedByIframe
+                ? 'Impression bloquée par l’aperçu'
+                : 'Test d’impression impossible',
+              message:
+                res.error ||
+                "Ouvrez l'application dans un onglet séparé ou utilisez l'export PDF.",
+            });
+          } else {
+            pushToast({
+              type: 'success',
+              title: 'Test d’impression envoyé',
+              message: window.electronAPI?.isElectron
+                ? 'La page de test a été transmise à l’imprimante.'
+                : 'Boîte de dialogue d’impression ouverte.',
+            });
+          }
+        };
+
+        return (
+          <form
+            onSubmit={handleSavePrintSettings}
+            className="rounded-lg border border-slate-200 bg-white p-6 space-y-6"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 className="text-base font-semibold text-slate-900">
+                  Configuration de l’impression
+                </h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  Ces paramètres s’appliquent aux factures, proformas, bons de commande, relevés et rapports.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleTestPrint}
+                className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                <Printer className="h-4 w-4 text-[#0F1E36]" />
+                <span>Test d’impression</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="sm:col-span-2">
+                <div className="flex items-center justify-between">
+                  <label className="block text-sm font-medium text-slate-700">
+                    Imprimante par défaut
+                  </label>
+                  {window.electronAPI?.isElectron && (
+                    <button
+                      type="button"
+                      onClick={refreshSystemPrinters}
+                      disabled={loadingPrinters}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-[#1D4ED8] hover:underline disabled:opacity-50"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${loadingPrinters ? 'animate-spin' : ''}`} />
+                      <span>Actualiser les imprimantes</span>
+                    </button>
+                  )}
+                </div>
+                {window.electronAPI?.isElectron ? (
+                  <select
+                    value={printPrinterName}
+                    onChange={(e) => setPrintPrinterName(e.target.value)}
+                    className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+                  >
+                    <option value="">Imprimante par défaut du système Windows</option>
+                    {systemPrinters.map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.displayName || p.name}
+                        {p.isDefault ? ' (Système par défaut)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="mt-1 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                    En mode navigateur Web, le choix de l’imprimante physique s’effectue dans la boîte de dialogue d’impression du navigateur. Dans l’application Windows (.exe), la liste complète des imprimantes installées apparaît automatiquement ici.
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Format papier</label>
+                <select
+                  value={printPaperSize}
+                  onChange={(e) => setPrintPaperSize(e.target.value as PrintPaperSize)}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+                >
+                  <option value="A4">A4 (210 × 297 mm)</option>
+                  <option value="A5">A5 (148 × 210 mm)</option>
+                  <option value="Letter">Letter (216 × 279 mm)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Orientation</label>
+                <select
+                  value={printOrientation}
+                  onChange={(e) => setPrintOrientation(e.target.value as PrintOrientation)}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+                >
+                  <option value="portrait">Portrait</option>
+                  <option value="landscape">Paysage</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Marges</label>
+                <select
+                  value={printMargins}
+                  onChange={(e) => setPrintMargins(e.target.value as PrintMarginMode)}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+                >
+                  <option value="none">Aucune marge (modèles A4 plein bord)</option>
+                  <option value="minimum">Minimum</option>
+                  <option value="default">Normales</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700">
+                  Nombre de copies
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={99}
+                  value={printCopies}
+                  onChange={(e) => setPrintCopies(e.target.value)}
+                  className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm tabular-nums"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 rounded-lg border border-slate-200 bg-slate-50 p-4 sm:grid-cols-2">
+              <label className="flex items-center gap-2.5 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={printColor}
+                  onChange={(e) => setPrintColor(e.target.checked)}
+                />
+                <span>Impression en couleur</span>
+              </label>
+
+              <label className="flex items-center gap-2.5 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={printFitToPage}
+                  onChange={(e) => setPrintFitToPage(e.target.checked)}
+                />
+                <span>Ajuster automatiquement à la page</span>
+              </label>
+
+              <label className="flex items-center gap-2.5 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={printPreviewBefore}
+                  onChange={(e) => setPrintPreviewBefore(e.target.checked)}
+                />
+                <span>Afficher l’aperçu avant impression</span>
+              </label>
+
+              <label className="flex items-center gap-2.5 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={printSilent}
+                  onChange={(e) => setPrintSilent(e.target.checked)}
+                />
+                <span>Impression silencieuse (sans fenêtre système, si supporté)</span>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-between border-t border-slate-200 pt-4">
+              <button
+                type="button"
+                onClick={() => {
+                  setPrintPrinterName(DEFAULT_PRINT_SETTINGS.defaultPrinterName);
+                  setPrintPaperSize(DEFAULT_PRINT_SETTINGS.paperSize);
+                  setPrintOrientation(DEFAULT_PRINT_SETTINGS.orientation);
+                  setPrintMargins(DEFAULT_PRINT_SETTINGS.margins);
+                  setPrintColor(DEFAULT_PRINT_SETTINGS.color);
+                  setPrintCopies(String(DEFAULT_PRINT_SETTINGS.copies));
+                  setPrintFitToPage(DEFAULT_PRINT_SETTINGS.fitToPage);
+                  setPrintPreviewBefore(DEFAULT_PRINT_SETTINGS.previewBeforePrint);
+                  setPrintSilent(DEFAULT_PRINT_SETTINGS.silentPrint);
+                }}
+                className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600 hover:text-slate-900"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>Réinitialiser par défaut</span>
+              </button>
+
+              <button
+                type="submit"
+                className="inline-flex items-center gap-2 rounded-md bg-[#0F1E36] px-5 py-2 text-sm font-medium text-white hover:bg-[#1a2f52]"
+              >
+                <Save className="h-4 w-4" />
+                <span>Enregistrer les réglages d’impression</span>
+              </button>
+            </div>
+          </form>
+        );
+      })()}
 
       {/* Onglet 3 : Sauvegardes & Restauration */}
       {activeTab === 'sauvegardes' && (

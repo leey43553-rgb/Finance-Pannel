@@ -8,11 +8,13 @@ import {
   Eye,
   FileCheck2,
   FileText,
+  Link2,
   Megaphone,
   Paperclip,
   Plus,
   Search,
   Trash2,
+  Unlink,
   X,
 } from 'lucide-react';
 import { db } from '../db/database';
@@ -23,6 +25,7 @@ import type {
   Proforma,
   PurchaseOrder,
 } from '../db/types';
+import { linkOrUnlinkDocumentToCampaign, saveCampaign } from '../services/documentActions';
 import {
   computeBcRecuInvoicingStatus,
   computeCampaignDuration,
@@ -32,6 +35,7 @@ import {
 } from '../utils/documentHelpers';
 import { computeInvoicePaidCentimes } from '../utils/finance';
 import { addMoney, formatMoney, subtractMoney } from '../utils/money';
+import { useAppStore } from '../store/useAppStore';
 import { CampaignFormModal } from '../components/CampaignFormModal';
 import { PurchaseOrderFormModal } from '../components/PurchaseOrderFormModal';
 import { ProformaFormModal } from '../components/ProformaFormModal';
@@ -75,7 +79,16 @@ type SortColumn =
   | 'remaining'
   | 'status';
 
+type InlineEditCell =
+  | { id: string; field: 'name'; value: string }
+  | { id: string; field: 'clientId'; value: string }
+  | { id: string; field: 'startDate'; value: string }
+  | { id: string; field: 'endDate'; value: string }
+  | { id: string; field: 'status'; value: CampaignStatus }
+  | { id: string; field: 'notes'; value: string };
+
 export const CampaignsPage: React.FC = () => {
+  const pushToast = useAppStore((s) => s.pushToast);
   const settings = useLiveQuery(() => db.settings.get('company_settings'));
   const campaigns = useLiveQuery(
     () => db.campaigns.filter((c) => !c.deletedAt).toArray(),
@@ -118,10 +131,16 @@ export const CampaignsPage: React.FC = () => {
   const [sortBy, setSortBy] = useState<SortColumn>('startDate');
   const [sortAsc, setSortAsc] = useState(false);
 
+  const [editingCell, setEditingCell] = useState<InlineEditCell | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [editingCampaign, setEditingCampaign] = useState<Campaign | undefined>(undefined);
   const [detailCampaignId, setDetailCampaignId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; label: string } | null>(null);
+
+  // Rattachement rapide de documents existants dans la fiche campagne
+  const [attachBcId, setAttachBcId] = useState('');
+  const [attachPfId, setAttachPfId] = useState('');
+  const [attachInvId, setAttachInvId] = useState('');
 
   // Modales rapides depuis le détail campagne
   const [poModalOpen, setPoModalOpen] = useState(false);
@@ -163,7 +182,7 @@ export const CampaignsPage: React.FC = () => {
   const yearOptions = useMemo(() => {
     const set = new Set<string>();
     for (const cmp of campaigns) {
-      const y = cmp.startDate.slice(0, 4);
+      const y = (cmp.startDate || '').slice(0, 4);
       if (/^\d{4}$/.test(y)) set.add(y);
     }
     return Array.from(set).sort((a, b) => b.localeCompare(a));
@@ -234,7 +253,6 @@ export const CampaignsPage: React.FC = () => {
 
         const remainingBase = Math.max(0, subtractMoney(invoicedTtcBase, collectedBase));
 
-        // Paiements alloués à ces factures
         const allocByPayment = new Map<string, number>();
         for (const a of allocations) {
           if (
@@ -274,8 +292,10 @@ export const CampaignsPage: React.FC = () => {
       })
       .filter((row) => {
         if (clientFilter !== 'tous' && row.cmp.clientId !== clientFilter) return false;
-        if (yearFilter !== 'toutes' && !row.cmp.startDate.startsWith(yearFilter)) return false;
-        if (monthFilter !== 'tous' && row.cmp.startDate.slice(5, 7) !== monthFilter) return false;
+        if (yearFilter !== 'toutes' && !(row.cmp.startDate || '').startsWith(yearFilter))
+          return false;
+        if (monthFilter !== 'tous' && (row.cmp.startDate || '').slice(5, 7) !== monthFilter)
+          return false;
         if (statusFilter !== 'tous' && row.effectiveStatus !== statusFilter) return false;
         if (q) {
           const hay = `${row.cmp.name} ${row.clientLabel} ${row.cmp.notes}`.toLowerCase();
@@ -294,10 +314,10 @@ export const CampaignsPage: React.FC = () => {
           cmp = a.clientLabel.localeCompare(b.clientLabel, 'fr');
           break;
         case 'startDate':
-          cmp = a.cmp.startDate.localeCompare(b.cmp.startDate);
+          cmp = (a.cmp.startDate || '').localeCompare(b.cmp.startDate || '');
           break;
         case 'endDate':
-          cmp = a.cmp.endDate.localeCompare(b.cmp.endDate);
+          cmp = (a.cmp.endDate || '').localeCompare(b.cmp.endDate || '');
           break;
         case 'duration':
           cmp = a.duration.days - b.duration.days;
@@ -354,11 +374,119 @@ export const CampaignsPage: React.FC = () => {
     [enrichedRows, detailCampaignId]
   );
 
+  const attachableDocs = useMemo(() => {
+    if (!detailRow) return { bcs: [], pfs: [], invs: [] };
+    const attachedBcIds = new Set(detailRow.cmpBcs.map((b) => b.id));
+    const attachedPfIds = new Set(detailRow.cmpProformas.map((p) => p.id));
+    const attachedInvIds = new Set(detailRow.cmpInvoices.map((i) => i.id));
+    return {
+      bcs: purchaseOrders.filter(
+        (p) => p.direction === 'bc_recu' && !attachedBcIds.has(p.id)
+      ),
+      pfs: proformas.filter((p) => !attachedPfIds.has(p.id)),
+      invs: customerInvoices.filter((i) => i.status !== 'annulee' && !attachedInvIds.has(i.id)),
+    };
+  }, [detailRow, purchaseOrders, proformas, customerInvoices]);
+
   const toggleSort = (col: SortColumn) => {
     if (sortBy === col) setSortAsc(!sortAsc);
     else {
       setSortBy(col);
       setSortAsc(col === 'name' || col === 'client');
+    }
+  };
+
+  const commitInlineEdit = async (overrideCell?: InlineEditCell) => {
+    const cell = overrideCell || editingCell;
+    if (!cell) return;
+    const cmp = campaigns.find((c) => c.id === cell.id);
+    setEditingCell(null);
+    if (!cmp) return;
+
+    const nextName = cell.field === 'name' ? cell.value.trim() : cmp.name;
+    const nextClientId = cell.field === 'clientId' ? cell.value : cmp.clientId;
+    const nextStart = cell.field === 'startDate' ? cell.value : cmp.startDate;
+    const nextEnd = cell.field === 'endDate' ? cell.value : cmp.endDate;
+    const nextStatus = cell.field === 'status' ? cell.value : cmp.status;
+    const nextNotes = cell.field === 'notes' ? cell.value.trim() : cmp.notes;
+
+    if (
+      nextName === cmp.name &&
+      nextClientId === cmp.clientId &&
+      nextStart === cmp.startDate &&
+      nextEnd === cmp.endDate &&
+      nextStatus === cmp.status &&
+      nextNotes === cmp.notes
+    ) {
+      return;
+    }
+
+    try {
+      await saveCampaign({
+        existingId: cmp.id,
+        name: nextName || cmp.name,
+        clientId: nextClientId,
+        companyProfileId: cmp.companyProfileId,
+        startDate: nextStart,
+        endDate: nextEnd,
+        status: nextStatus,
+        notes: nextNotes,
+        propagateToLinkedDocs: true,
+        propagateClient: nextClientId !== cmp.clientId,
+      });
+      pushToast({ type: 'success', title: 'Campagne mise à jour' });
+    } catch (err) {
+      pushToast({
+        type: 'error',
+        title: 'Modification impossible',
+        message: err instanceof Error ? err.message : 'Erreur',
+      });
+    }
+  };
+
+  const handleLinkDoc = async (docType: 'bc' | 'proforma' | 'invoice', docId: string) => {
+    if (!detailRow || !docId) return;
+    try {
+      await linkOrUnlinkDocumentToCampaign({
+        campaignId: detailRow.cmp.id,
+        docType,
+        docId,
+        link: true,
+      });
+      if (docType === 'bc') setAttachBcId('');
+      else if (docType === 'proforma') setAttachPfId('');
+      else setAttachInvId('');
+      pushToast({ type: 'success', title: 'Document rattaché à la campagne' });
+    } catch (err) {
+      pushToast({
+        type: 'error',
+        title: 'Erreur',
+        message: err instanceof Error ? err.message : 'Erreur',
+      });
+    }
+  };
+
+  const handleUnlinkDoc = async (
+    e: React.MouseEvent,
+    docType: 'bc' | 'proforma' | 'invoice',
+    docId: string
+  ) => {
+    e.stopPropagation();
+    if (!detailRow) return;
+    try {
+      await linkOrUnlinkDocumentToCampaign({
+        campaignId: detailRow.cmp.id,
+        docType,
+        docId,
+        link: false,
+      });
+      pushToast({ type: 'info', title: 'Document détaché de la campagne' });
+    } catch (err) {
+      pushToast({
+        type: 'error',
+        title: 'Erreur',
+        message: err instanceof Error ? err.message : 'Erreur',
+      });
     }
   };
 
@@ -580,28 +708,210 @@ export const CampaignsPage: React.FC = () => {
             ) : (
               enrichedRows.map((row) => {
                 const st = CAMPAIGN_STATUS_META[row.effectiveStatus];
+                const isEditingName =
+                  editingCell?.id === row.cmp.id && editingCell.field === 'name';
+                const isEditingNotes =
+                  editingCell?.id === row.cmp.id && editingCell.field === 'notes';
+                const isEditingClient =
+                  editingCell?.id === row.cmp.id && editingCell.field === 'clientId';
+                const isEditingStart =
+                  editingCell?.id === row.cmp.id && editingCell.field === 'startDate';
+                const isEditingEnd =
+                  editingCell?.id === row.cmp.id && editingCell.field === 'endDate';
+                const isEditingStatus =
+                  editingCell?.id === row.cmp.id && editingCell.field === 'status';
+
                 return (
                   <tr
                     key={row.cmp.id}
                     onClick={() => setDetailCampaignId(row.cmp.id)}
                     className="cursor-pointer hover:bg-slate-50"
                   >
-                    <td className="px-3 py-2.5 font-semibold text-slate-900">
-                      <div className="flex items-center gap-1.5">
-                        <Megaphone className="h-3.5 w-3.5 shrink-0 text-[#1D4ED8]" />
-                        <span>{row.cmp.name}</span>
-                      </div>
+                    <td
+                      className="px-3 py-2.5 font-semibold text-slate-900"
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        setEditingCell({ id: row.cmp.id, field: 'name', value: row.cmp.name });
+                      }}
+                      title="Double-cliquez pour modifier le nom"
+                    >
+                      {isEditingName ? (
+                        <input
+                          type="text"
+                          autoFocus
+                          value={editingCell.value}
+                          onChange={(e) =>
+                            setEditingCell({ ...editingCell, value: e.target.value })
+                          }
+                          onBlur={() => commitInlineEdit()}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              commitInlineEdit();
+                            } else if (e.key === 'Escape') {
+                              setEditingCell(null);
+                            }
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          className="w-full rounded border border-[#1D4ED8] bg-white px-2 py-1 text-xs font-semibold"
+                        />
+                      ) : (
+                        <div className="flex items-center gap-1.5">
+                          <Megaphone className="h-3.5 w-3.5 shrink-0 text-[#1D4ED8]" />
+                          <span>{row.cmp.name}</span>
+                        </div>
+                      )}
+                      {isEditingNotes ? (
+                        <input
+                          type="text"
+                          autoFocus
+                          value={editingCell.value}
+                          onChange={(e) =>
+                            setEditingCell({ ...editingCell, value: e.target.value })
+                          }
+                          onBlur={() => commitInlineEdit()}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              commitInlineEdit();
+                            } else if (e.key === 'Escape') {
+                              setEditingCell(null);
+                            }
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          placeholder="Notes..."
+                          className="mt-1 w-full rounded border border-[#1D4ED8] bg-white px-1.5 py-0.5 text-[11px] font-normal"
+                        />
+                      ) : row.cmp.notes ? (
+                        <div
+                          onDoubleClick={(e) => {
+                            e.stopPropagation();
+                            setEditingCell({
+                              id: row.cmp.id,
+                              field: 'notes',
+                              value: row.cmp.notes,
+                            });
+                          }}
+                          className="mt-0.5 max-w-[220px] truncate text-[10px] font-normal text-slate-500"
+                          title={row.cmp.notes}
+                        >
+                          {row.cmp.notes}
+                        </div>
+                      ) : null}
                     </td>
-                    <td className="px-3 py-2.5 text-slate-700">{row.clientLabel}</td>
-                    <td className="px-3 py-2.5 text-slate-600 tabular-nums whitespace-nowrap">
-                      {formatDateFr(row.cmp.startDate)}
+
+                    <td
+                      className="px-3 py-2.5 text-slate-700"
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        setEditingCell({
+                          id: row.cmp.id,
+                          field: 'clientId',
+                          value: row.cmp.clientId,
+                        });
+                      }}
+                      title="Double-cliquez pour changer le client"
+                    >
+                      {isEditingClient ? (
+                        <select
+                          autoFocus
+                          value={editingCell.value}
+                          onChange={(e) =>
+                            commitInlineEdit({
+                              id: row.cmp.id,
+                              field: 'clientId',
+                              value: e.target.value,
+                            })
+                          }
+                          onBlur={() => setEditingCell(null)}
+                          onClick={(e) => e.stopPropagation()}
+                          className="rounded border border-[#1D4ED8] bg-white px-1.5 py-1 text-xs"
+                        >
+                          {clientOptions.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.company || c.name}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        row.clientLabel
+                      )}
                     </td>
-                    <td className="px-3 py-2.5 text-slate-600 tabular-nums whitespace-nowrap">
-                      {formatDateFr(row.cmp.endDate)}
+
+                    <td
+                      className="px-3 py-2.5 text-slate-600 tabular-nums whitespace-nowrap"
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        setEditingCell({
+                          id: row.cmp.id,
+                          field: 'startDate',
+                          value: row.cmp.startDate || '',
+                        });
+                      }}
+                      title="Double-cliquez pour modifier la date de début"
+                    >
+                      {isEditingStart ? (
+                        <input
+                          type="date"
+                          autoFocus
+                          value={editingCell.value}
+                          onChange={(e) =>
+                            setEditingCell({ ...editingCell, value: e.target.value })
+                          }
+                          onBlur={() => commitInlineEdit()}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') commitInlineEdit();
+                            else if (e.key === 'Escape') setEditingCell(null);
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          className="rounded border border-[#1D4ED8] bg-white px-1.5 py-0.5 text-xs"
+                        />
+                      ) : row.cmp.startDate ? (
+                        formatDateFr(row.cmp.startDate)
+                      ) : (
+                        '—'
+                      )}
                     </td>
+
+                    <td
+                      className="px-3 py-2.5 text-slate-600 tabular-nums whitespace-nowrap"
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        setEditingCell({
+                          id: row.cmp.id,
+                          field: 'endDate',
+                          value: row.cmp.endDate || '',
+                        });
+                      }}
+                      title="Double-cliquez pour modifier la date de fin"
+                    >
+                      {isEditingEnd ? (
+                        <input
+                          type="date"
+                          autoFocus
+                          value={editingCell.value}
+                          onChange={(e) =>
+                            setEditingCell({ ...editingCell, value: e.target.value })
+                          }
+                          onBlur={() => commitInlineEdit()}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') commitInlineEdit();
+                            else if (e.key === 'Escape') setEditingCell(null);
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          className="rounded border border-[#1D4ED8] bg-white px-1.5 py-0.5 text-xs"
+                        />
+                      ) : row.cmp.endDate ? (
+                        formatDateFr(row.cmp.endDate)
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+
                     <td className="px-3 py-2.5 text-slate-700 whitespace-nowrap">
-                      {row.duration.label}
+                      {row.cmp.startDate && row.cmp.endDate ? row.duration.label : '—'}
                     </td>
+
                     <td className="px-3 py-2.5 text-center text-slate-600 whitespace-nowrap">
                       {row.cmpBcs.length} BC · {row.cmpProformas.length} PF · {row.cmpInvoices.length} Fac
                     </td>
@@ -618,13 +928,48 @@ export const CampaignsPage: React.FC = () => {
                     >
                       {formatMoney(row.remainingBase, defaultCurrency, currencies)}
                     </td>
-                    <td className="px-3 py-2.5 whitespace-nowrap">
-                      <span
-                        className={`inline-block rounded px-2 py-0.5 text-[11px] font-medium ${st.badgeClass}`}
-                      >
-                        {st.label}
-                      </span>
+
+                    <td
+                      className="px-3 py-2.5 whitespace-nowrap"
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        setEditingCell({
+                          id: row.cmp.id,
+                          field: 'status',
+                          value: row.cmp.status,
+                        });
+                      }}
+                      title="Double-cliquez pour changer le statut"
+                    >
+                      {isEditingStatus ? (
+                        <select
+                          autoFocus
+                          value={editingCell.value}
+                          onChange={(e) =>
+                            commitInlineEdit({
+                              id: row.cmp.id,
+                              field: 'status',
+                              value: e.target.value as CampaignStatus,
+                            })
+                          }
+                          onBlur={() => setEditingCell(null)}
+                          onClick={(e) => e.stopPropagation()}
+                          className="rounded border border-[#1D4ED8] bg-white px-1.5 py-0.5 text-xs"
+                        >
+                          <option value="prevue">Prévue</option>
+                          <option value="en_cours">En cours</option>
+                          <option value="terminee">Terminée</option>
+                          <option value="annulee">Annulée</option>
+                        </select>
+                      ) : (
+                        <span
+                          className={`inline-block rounded px-2 py-0.5 text-[11px] font-medium ${st.badgeClass}`}
+                        >
+                          {st.label}
+                        </span>
+                      )}
                     </td>
+
                     <td
                       className="px-3 py-2.5 text-right whitespace-nowrap"
                       onClick={(e) => e.stopPropagation()}
@@ -644,7 +989,7 @@ export const CampaignsPage: React.FC = () => {
                             setEditingCampaign(row.cmp);
                             setFormOpen(true);
                           }}
-                          title="Modifier"
+                          title="Modifier toute la campagne"
                           className="rounded p-1 text-slate-600 hover:bg-slate-100"
                         >
                           <Edit3 className="h-3.5 w-3.5" />
@@ -690,6 +1035,9 @@ export const CampaignsPage: React.FC = () => {
           )}
         </table>
       </div>
+      <p className="text-xs text-slate-500">
+        Astuce : double-cliquez sur le nom, le client, les dates ou le statut d’une ligne pour modifier directement, ou cliquez sur l’icône crayon pour tout modifier et mettre à jour les documents liés.
+      </p>
 
       {/* Modale Détail complet de la campagne */}
       {detailRow && (
@@ -709,20 +1057,37 @@ export const CampaignsPage: React.FC = () => {
                   </span>
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-slate-300">
-                  <span>Client : <strong className="text-white">{detailRow.clientLabel}</strong></span>
+                  <span>
+                    Client : <strong className="text-white">{detailRow.clientLabel}</strong>
+                  </span>
                   <span className="inline-flex items-center gap-1">
                     <Calendar className="h-3.5 w-3.5" />
-                    Du {formatDateFr(detailRow.cmp.startDate)} au {formatDateFr(detailRow.cmp.endDate)} ({detailRow.duration.label})
+                    {detailRow.cmp.startDate && detailRow.cmp.endDate
+                      ? `Du ${formatDateFr(detailRow.cmp.startDate)} au ${formatDateFr(detailRow.cmp.endDate)} (${detailRow.duration.label})`
+                      : 'Dates non définies'}
                   </span>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setDetailCampaignId(null)}
-                className="rounded p-1 text-slate-300 hover:bg-slate-800 hover:text-white"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingCampaign(detailRow.cmp);
+                    setFormOpen(true);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-slate-500 bg-slate-800 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700"
+                >
+                  <Edit3 className="h-3.5 w-3.5" />
+                  <span>Modifier</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDetailCampaignId(null)}
+                  className="rounded p-1 text-slate-300 hover:bg-slate-800 hover:text-white"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-6 space-y-5">
@@ -812,9 +1177,33 @@ export const CampaignsPage: React.FC = () => {
 
               <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
                 {/* BC Reçus */}
-                <div className="rounded-lg border border-slate-200">
-                  <div className="border-b border-slate-200 bg-slate-50 px-4 py-2.5 text-xs font-semibold text-slate-700">
-                    Bons de commande reçus ({detailRow.cmpBcs.length})
+                <div className="rounded-lg border border-slate-200 flex flex-col">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2.5 text-xs font-semibold text-slate-700">
+                    <span>Bons de commande reçus ({detailRow.cmpBcs.length})</span>
+                    {attachableDocs.bcs.length > 0 && (
+                      <div className="flex items-center gap-1">
+                        <select
+                          value={attachBcId}
+                          onChange={(e) => setAttachBcId(e.target.value)}
+                          className="max-w-[160px] rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] font-normal"
+                        >
+                          <option value="">Rattacher un BC...</option>
+                          {attachableDocs.bcs.map((b) => (
+                            <option key={b.id} value={b.id}>
+                              BC {b.poNumber}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          disabled={!attachBcId}
+                          onClick={() => handleLinkDoc('bc', attachBcId)}
+                          className="inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+                        >
+                          <Link2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                   {detailRow.cmpBcs.length === 0 ? (
                     <div className="p-4 text-center text-xs text-slate-500">
@@ -864,7 +1253,7 @@ export const CampaignsPage: React.FC = () => {
                                 Reçu le {formatDateFr(po.issueDate)} · Statut : {bcStatus}
                               </div>
                             </div>
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-1.5">
                               <span className="font-semibold text-slate-900 tabular-nums">
                                 {formatMoney(po.totalTtcCentimes, po.currency, currencies)}
                               </span>
@@ -880,6 +1269,14 @@ export const CampaignsPage: React.FC = () => {
                               >
                                 Facturer
                               </button>
+                              <button
+                                type="button"
+                                onClick={(e) => handleUnlinkDoc(e, 'bc', po.id)}
+                                title="Détacher de la campagne"
+                                className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600"
+                              >
+                                <Unlink className="h-3 w-3" />
+                              </button>
                             </div>
                           </div>
                         );
@@ -889,9 +1286,33 @@ export const CampaignsPage: React.FC = () => {
                 </div>
 
                 {/* Proformas */}
-                <div className="rounded-lg border border-slate-200">
-                  <div className="border-b border-slate-200 bg-slate-50 px-4 py-2.5 text-xs font-semibold text-slate-700">
-                    Devis / Proformas ({detailRow.cmpProformas.length})
+                <div className="rounded-lg border border-slate-200 flex flex-col">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2.5 text-xs font-semibold text-slate-700">
+                    <span>Devis / Proformas ({detailRow.cmpProformas.length})</span>
+                    {attachableDocs.pfs.length > 0 && (
+                      <div className="flex items-center gap-1">
+                        <select
+                          value={attachPfId}
+                          onChange={(e) => setAttachPfId(e.target.value)}
+                          className="max-w-[160px] rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] font-normal"
+                        >
+                          <option value="">Rattacher un proforma...</option>
+                          {attachableDocs.pfs.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.proformaNumber}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          disabled={!attachPfId}
+                          onClick={() => handleLinkDoc('proforma', attachPfId)}
+                          className="inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+                        >
+                          <Link2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                   {detailRow.cmpProformas.length === 0 ? (
                     <div className="p-4 text-center text-xs text-slate-500">
@@ -917,9 +1338,19 @@ export const CampaignsPage: React.FC = () => {
                                 {formatDateFr(pf.issueDate)} · Statut : {eff}
                               </div>
                             </div>
-                            <span className="font-semibold text-slate-900 tabular-nums">
-                              {formatMoney(pf.totalTtcCentimes, pf.currency, currencies)}
-                            </span>
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-semibold text-slate-900 tabular-nums">
+                                {formatMoney(pf.totalTtcCentimes, pf.currency, currencies)}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={(e) => handleUnlinkDoc(e, 'proforma', pf.id)}
+                                title="Détacher de la campagne"
+                                className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600"
+                              >
+                                <Unlink className="h-3 w-3" />
+                              </button>
+                            </div>
                           </div>
                         );
                       })}
@@ -928,9 +1359,33 @@ export const CampaignsPage: React.FC = () => {
                 </div>
 
                 {/* Factures clients */}
-                <div className="rounded-lg border border-slate-200">
-                  <div className="border-b border-slate-200 bg-slate-50 px-4 py-2.5 text-xs font-semibold text-slate-700">
-                    Factures clients ({detailRow.cmpInvoices.length})
+                <div className="rounded-lg border border-slate-200 flex flex-col">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2.5 text-xs font-semibold text-slate-700">
+                    <span>Factures clients ({detailRow.cmpInvoices.length})</span>
+                    {attachableDocs.invs.length > 0 && (
+                      <div className="flex items-center gap-1">
+                        <select
+                          value={attachInvId}
+                          onChange={(e) => setAttachInvId(e.target.value)}
+                          className="max-w-[160px] rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] font-normal"
+                        >
+                          <option value="">Rattacher une facture...</option>
+                          {attachableDocs.invs.map((inv) => (
+                            <option key={inv.id} value={inv.id}>
+                              Facture {inv.invoiceNumber}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          disabled={!attachInvId}
+                          onClick={() => handleLinkDoc('invoice', attachInvId)}
+                          className="inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+                        >
+                          <Link2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                   {detailRow.cmpInvoices.length === 0 ? (
                     <div className="p-4 text-center text-xs text-slate-500">
@@ -964,25 +1419,35 @@ export const CampaignsPage: React.FC = () => {
                                 {inv.bcNumber ? ` · BC ${inv.bcNumber}` : ''}
                               </div>
                             </div>
-                            <div className="text-right tabular-nums">
-                              <div className="font-semibold text-slate-900">
-                                {formatMoney(inv.totalTtcCentimes, inv.currency, currencies)}
-                              </div>
-                              <div
-                                className={`text-[11px] ${
-                                  inv.status === 'annulee'
-                                    ? 'text-slate-400'
+                            <div className="flex items-center gap-2">
+                              <div className="text-right tabular-nums">
+                                <div className="font-semibold text-slate-900">
+                                  {formatMoney(inv.totalTtcCentimes, inv.currency, currencies)}
+                                </div>
+                                <div
+                                  className={`text-[11px] ${
+                                    inv.status === 'annulee'
+                                      ? 'text-slate-400'
+                                      : rem > 0
+                                      ? 'text-red-600'
+                                      : 'text-emerald-700'
+                                  }`}
+                                >
+                                  {inv.status === 'annulee'
+                                    ? 'Annulée'
                                     : rem > 0
-                                    ? 'text-red-600'
-                                    : 'text-emerald-700'
-                                }`}
-                              >
-                                {inv.status === 'annulee'
-                                  ? 'Annulée'
-                                  : rem > 0
-                                  ? `Reste : ${formatMoney(rem, inv.currency, currencies)}`
-                                  : 'Payée'}
+                                    ? `Reste : ${formatMoney(rem, inv.currency, currencies)}`
+                                    : 'Payée'}
+                                </div>
                               </div>
+                              <button
+                                type="button"
+                                onClick={(e) => handleUnlinkDoc(e, 'invoice', inv.id)}
+                                title="Détacher de la campagne"
+                                className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600"
+                              >
+                                <Unlink className="h-3 w-3" />
+                              </button>
                             </div>
                           </div>
                         );

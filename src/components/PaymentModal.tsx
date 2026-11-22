@@ -363,6 +363,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
                   >
                     <option value="especes">Espèces (Caisse)</option>
                     <option value="virement">Virement bancaire</option>
+                    <option value="versement">Versement</option>
                     <option value="cheque">Chèque</option>
                     <option value="carte">Carte bancaire</option>
                   </select>
